@@ -424,15 +424,19 @@ class MainWindow(QMainWindow):
         self._crop_min = pts.min(axis=0)
         self._crop_max = pts.max(axis=0)
 
-        if self._crop_panel is None:
-            self._crop_panel = CropPanel(source_name, parent=self)
-            self._crop_panel.apply_requested.connect(self._on_crop_apply)
-            self._crop_panel.cancel_requested.connect(self._on_crop_cancel)
-            self._crop_panel.export_requested.connect(self._on_crop_export)
-            self._crop_panel.visibility_changed.connect(self._on_crop_visibility)
-            self._crop_panel.lasso_started.connect(self._on_lasso_started)
-            self._crop_panel.lasso_apply_requested.connect(self._on_lasso_apply)
-            self._crop_panel.lasso_cancel_requested.connect(self._on_lasso_cancel)
+        # Recrear el panel siempre: evita instancias viejas superpuestas y
+        # estados obsoletos (nombre de fuente, checkboxes post-crop, etc.)
+        if self._crop_panel is not None:
+            self._crop_panel.hide()
+            self._crop_panel.deleteLater()
+        self._crop_panel = CropPanel(source_name, parent=self)
+        self._crop_panel.apply_requested.connect(self._on_crop_apply)
+        self._crop_panel.cancel_requested.connect(self._on_crop_cancel)
+        self._crop_panel.export_requested.connect(self._on_crop_export)
+        self._crop_panel.visibility_changed.connect(self._on_crop_visibility)
+        self._crop_panel.lasso_started.connect(self._on_lasso_started)
+        self._crop_panel.lasso_apply_requested.connect(self._on_lasso_apply)
+        self._crop_panel.lasso_cancel_requested.connect(self._on_lasso_cancel)
 
         viewer_pos = self.viewer.mapTo(self, self.viewer.rect().topLeft())
         self._crop_panel.move(viewer_pos.x() + 10, viewer_pos.y() + 10)
@@ -532,8 +536,8 @@ class MainWindow(QMainWindow):
 
         self.viewer.start_lasso(self._on_lasso_polygon_closed)
         self.show_status(
-            "Haz clic para agregar vertices. "
-            "Clic derecho o doble clic para cerrar el lazo."
+            "Haz clic para agregar vertices. Cierra el lazo con clic derecho, "
+            "doble clic, o clicando sobre el primer vertice."
         )
 
     def _on_lasso_polygon_closed(self, verts: list[tuple[int, int]]) -> None:
@@ -543,9 +547,16 @@ class MainWindow(QMainWindow):
         from app.modules.processing import apply_lasso
 
         screen_pts, valid = self.viewer.project_cloud_to_screen(self._lasso_source)
+
+        # Sin seleccion previa, Quitar/Intersectar parten de la nube completa:
+        # "quitar estos puntos" significa "todo menos esto".
+        mask_base = self._lasso_mask
+        if not mask_base.any() and self._lasso_set_op in ("difference", "intersection"):
+            mask_base = np.ones(len(mask_base), dtype=bool)
+
         try:
             new_mask = apply_lasso(
-                screen_pts, valid, verts, self._lasso_set_op, self._lasso_mask
+                screen_pts, valid, verts, self._lasso_set_op, mask_base
             )
         except ValueError as e:
             self.show_status(str(e))
@@ -563,7 +574,7 @@ class MainWindow(QMainWindow):
         if self._crop_panel is not None:
             self._crop_panel.set_lasso_active(False)
             self._crop_panel.set_lasso_has_selection(
-                self._lasso_mask is not None and self._lasso_mask.any()
+                bool(self._lasso_mask is not None and self._lasso_mask.any())
             )
 
         self.viewer.highlight_selection(
