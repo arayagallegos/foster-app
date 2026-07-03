@@ -1,0 +1,359 @@
+"""
+io.py — Carga y exportación de archivos de nubes de puntos.
+
+Soporta: .e57, .las, .laz, .ply, .pcd
+"""
+
+from __future__ import annotations
+from pathlib import Path
+
+import numpy as np
+import open3d as o3d
+
+
+# ------------------------------------------------------------------ #
+# Función pública principal                                            #
+# ------------------------------------------------------------------ #
+
+def load_point_cloud(path: str) -> o3d.geometry.PointCloud:
+    """
+    Carga una nube de puntos desde disco.
+    Detecta el formato por extensión y delega al loader correspondiente.
+
+    Args:
+        path: Ruta absoluta al archivo.
+
+    Returns:
+        Nube de puntos Open3D lista para usar.
+
+    Raises:
+        ValueError: Si el formato no está soportado.
+        FileNotFoundError: Si el archivo no existe.
+        RuntimeError: Si la carga falla por contenido inválido.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Archivo no encontrado: {path}")
+
+    ext = p.suffix.lower()
+
+    loaders = {
+        ".e57": _load_e57,
+        ".las":  _load_las,
+        ".laz":  _load_las,
+        ".ply":  _load_ply,
+        ".pcd":  _load_pcd,
+    }
+
+    if ext not in loaders:
+        supported = ", ".join(loaders.keys())
+        raise ValueError(
+            f"Formato '{ext}' no soportado. "
+            f"Formatos válidos: {supported}"
+        )
+
+    pcd = loaders[ext](str(path))
+
+    if len(pcd.points) == 0:
+        raise RuntimeError(
+            f"El archivo se cargó pero no contiene puntos: {path}"
+        )
+
+    return pcd
+
+
+def load_e57_scans(path: str, voxel_size: float = 0.05) -> list:
+    """
+    Carga cada scan del e57 por separado (sin combinar) para registro posterior.
+    Aplica downsampling ligero a cada scan para que el registro sea manejable.
+
+    Returns:
+        Lista de (PointCloud, scan_idx) — uno por scan en el archivo.
+    """
+    try:
+        import pye57
+    except ImportError:
+        raise ImportError("pip install pye57")
+
+    e57_file = pye57.E57(path)
+    n_scans = e57_file.scan_count
+    print(f"[io] Cargando {n_scans} scans individuales para registro...")
+
+    scans = []
+    for i in range(n_scans):
+        print(f"[io]   Scan {i+1}/{n_scans}...", end=" ", flush=True)
+        try:
+            data = e57_file.read_scan_raw(i)
+        except Exception as ex:
+            print(f"error: {ex}")
+            continue
+
+        if "cartesianX" not in data:
+            print("sin coordenadas, omitido.")
+            continue
+
+        xyz = np.column_stack([
+            np.asarray(data["cartesianX"], dtype=np.float32),
+            np.asarray(data["cartesianY"], dtype=np.float32),
+            np.asarray(data["cartesianZ"], dtype=np.float32),
+        ])
+        del data["cartesianX"], data["cartesianY"], data["cartesianZ"]
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+        del xyz
+
+        if "colorRed" in data:
+            colors = np.column_stack([
+                np.asarray(data["colorRed"],   dtype=np.float32),
+                np.asarray(data["colorGreen"], dtype=np.float32),
+                np.asarray(data["colorBlue"],  dtype=np.float32),
+            ]) / 255.0
+            pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+        del data
+
+        pcd_down = pcd.voxel_down_sample(voxel_size)
+        del pcd
+        print(f"{len(pcd_down.points):,} pts")
+        scans.append((pcd_down, i))
+
+    return scans
+
+
+def export_point_cloud(pcd: o3d.geometry.PointCloud, path: str) -> None:
+    """
+    Exporta una nube de puntos a disco.
+    Formato detectado por extensión (.ply, .pcd).
+    """
+    o3d.io.write_point_cloud(path, pcd, write_ascii=False)
+
+
+# ------------------------------------------------------------------ #
+# Loaders por formato                                                  #
+# ------------------------------------------------------------------ #
+
+def _load_ply(path: str) -> o3d.geometry.PointCloud:
+    """Carga un archivo .ply (salida típica de Metashape/RealityCapture)."""
+    pcd = o3d.io.read_point_cloud(path)
+    return pcd
+
+
+def _load_pcd(path: str) -> o3d.geometry.PointCloud:
+    """Carga un archivo .pcd (formato Open3D nativo)."""
+    pcd = o3d.io.read_point_cloud(path)
+    return pcd
+
+
+def _load_las(path: str) -> o3d.geometry.PointCloud:
+    """
+    Carga un archivo .las o .laz (formato LiDAR estándar).
+    Extrae XYZ y color RGB si está disponible.
+    """
+    try:
+        import laspy
+    except ImportError:
+        raise ImportError(
+            "Instala laspy para leer archivos .las/.laz:\n"
+            "pip install laspy[lazrs]"
+        )
+
+    las = laspy.read(path)
+    xyz = np.column_stack([
+        las.x.scaled_array(),
+        las.y.scaled_array(),
+        las.z.scaled_array(),
+    ])
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+
+    # Intentar extraer colores RGB (no todos los .las los tienen)
+    try:
+        r = np.asarray(las.red,   dtype=np.float64)
+        g = np.asarray(las.green, dtype=np.float64)
+        b = np.asarray(las.blue,  dtype=np.float64)
+
+        # LAS almacena colores en rango 0-65535, normalizar a 0-1
+        max_val = r.max() if r.max() > 0 else 1.0
+        if max_val > 255:
+            r, g, b = r / 65535.0, g / 65535.0, b / 65535.0
+        else:
+            r, g, b = r / 255.0,   g / 255.0,   b / 255.0
+
+        colors = np.column_stack([r, g, b])
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+    except Exception:
+        # Sin color: se coloreará por altura en el viewer
+        pass
+
+    return pcd
+
+
+def _load_e57(path: str, voxel_size: float = 0.03) -> o3d.geometry.PointCloud:
+    """
+    Carga un archivo .e57 grande de forma streaming: lee cada scan por separado,
+    aplica voxel downsampling inmediatamente y libera la memoria antes del siguiente.
+
+    Para un archivo de 19 GB esto es crítico: nunca se carga todo en RAM.
+    El resultado es una nube downsampleada lista para visualización.
+
+    Args:
+        path:       Ruta al archivo .e57
+        voxel_size: Tamaño de voxel en metros para downsampling por scan (default 3cm).
+                    Ajustar según el tamaño del edificio y la RAM disponible:
+                    - 0.02 (2cm): mayor detalle, más RAM
+                    - 0.03 (3cm): buen equilibrio para edificios pequeños
+                    - 0.05 (5cm): menos detalle, menos RAM
+    """
+    try:
+        import pye57
+    except ImportError:
+        raise ImportError(
+            "Instala pye57 para leer archivos .e57:\n"
+            "pip install pye57"
+        )
+
+    e57_file = pye57.E57(path)
+    n_scans = e57_file.scan_count
+    print(f"[io] .e57: {n_scans} scan(s) detectados. Leyendo con voxel={voxel_size}m...")
+
+    accumulated_pts    = []
+    accumulated_colors = []
+    total_raw          = 0
+    total_kept         = 0
+    has_color          = False
+
+    for scan_idx in range(n_scans):
+        print(f"[io]   Scan {scan_idx + 1}/{n_scans}...", end=" ", flush=True)
+        # read_scan filtra puntos inválidos (cartesianInvalidState/sphericalInvalidState)
+        # y aplica la transformación de pose local→global automáticamente.
+        # También convierte coordenadas esféricas a cartesianas si es necesario.
+        try:
+            data = e57_file.read_scan(scan_idx, colors=True, ignore_missing_fields=True)
+        except Exception as ex:
+            print(f"error: {ex}")
+            continue
+
+        if "cartesianX" not in data:
+            print("sin coordenadas válidas, omitido.")
+            continue
+
+        n_pts = len(data["cartesianX"])
+        total_raw += n_pts
+
+        # --- float32: mitad de memoria que float64 ---
+        xyz = np.column_stack([
+            np.asarray(data["cartesianX"], dtype=np.float32),
+            np.asarray(data["cartesianY"], dtype=np.float32),
+            np.asarray(data["cartesianZ"], dtype=np.float32),
+        ])
+
+        print(
+            f"\n[scan {scan_idx}]",
+            f"X[{xyz[:,0].min():.3f},{xyz[:,0].max():.3f}]",
+            f"Y[{xyz[:,1].min():.3f},{xyz[:,1].max():.3f}]",
+            f"Z[{xyz[:,2].min():.3f},{xyz[:,2].max():.3f}]"
+        )
+        # Liberar data de este scan inmediatamente
+        del data["cartesianX"], data["cartesianY"], data["cartesianZ"]
+
+        # Construir nube Open3D del scan
+        scan_pcd = o3d.geometry.PointCloud()
+        scan_pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+        del xyz  # liberar
+
+        # Color si existe
+        if "colorRed" in data and "colorGreen" in data and "colorBlue" in data:
+            colors = np.column_stack([
+                np.asarray(data["colorRed"],   dtype=np.float32),
+                np.asarray(data["colorGreen"], dtype=np.float32),
+                np.asarray(data["colorBlue"],  dtype=np.float32),
+            ]) / 255.0
+            scan_pcd.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
+            del colors
+            has_color = True
+
+        del data  # liberar todo el dict del scan
+
+        # --- Downsample inmediato: aquí está la clave ---
+        scan_down = scan_pcd.voxel_down_sample(voxel_size)
+        del scan_pcd  # liberar la nube full de este scan
+
+        n_down = len(scan_down.points)
+        total_kept += n_down
+        print(f"{n_pts:,} pts → {n_down:,} después de voxel")
+
+        accumulated_pts.append(np.asarray(scan_down.points, dtype=np.float32))
+        if has_color and scan_down.has_colors():
+            accumulated_colors.append(
+                np.asarray(scan_down.colors, dtype=np.float32)
+            )
+        del scan_down
+
+    if not accumulated_pts:
+        raise RuntimeError("El archivo .e57 no contiene scans con coordenadas válidas.")
+
+    print(
+        f"[io] Carga completa: {total_raw:,} pts originales → "
+        f"{total_kept:,} pts tras downsampling ({voxel_size*100:.0f}cm voxel)"
+    )
+
+    # Combinar todos los scans downsampleados
+    all_pts = np.vstack(accumulated_pts).astype(np.float64)
+    del accumulated_pts
+
+    result = o3d.geometry.PointCloud()
+    result.points = o3d.utility.Vector3dVector(all_pts)
+    del all_pts
+
+    if has_color and accumulated_colors:
+        all_colors = np.vstack(accumulated_colors).astype(np.float64)
+        result.colors = o3d.utility.Vector3dVector(np.clip(all_colors, 0, 1))
+        del accumulated_colors, all_colors
+
+    # Downsample final para eliminar solapamiento entre scans
+    final = result.voxel_down_sample(voxel_size)
+
+    print(f"[io] Nube final tras merge: {len(final.points):,} puntos")
+
+    bbox = final.get_axis_aligned_bounding_box()
+
+    print("\n========== DEBUG NUBE ==========")
+    print("Min:", bbox.min_bound)
+    print("Max:", bbox.max_bound)
+    print("Extent:", bbox.get_extent())
+    print("Center:", bbox.get_center())
+
+    pts = np.asarray(final.points)
+
+    print("Primeros 10 puntos:")
+    print(pts[:10])
+
+    print(
+        "Rangos XYZ:",
+        pts[:, 0].min(), pts[:, 0].max(),
+        pts[:, 1].min(), pts[:, 1].max(),
+        pts[:, 2].min(), pts[:, 2].max()
+    )
+
+    print("================================\n")
+
+    return final
+
+
+# ------------------------------------------------------------------ #
+# Utilidades                                                           #
+# ------------------------------------------------------------------ #
+
+SUPPORTED_EXTENSIONS = [".e57", ".las", ".laz", ".ply", ".pcd"]
+
+FILTER_STRING = (
+    "Nubes de puntos ("
+    + " ".join(f"*{ext}" for ext in SUPPORTED_EXTENSIONS)
+    + ");;"
+    + "E57 (*.e57);;"
+    + "LAS/LAZ (*.las *.laz);;"
+    + "PLY (*.ply);;"
+    + "PCD (*.pcd);;"
+    + "Todos los archivos (*)"
+)
