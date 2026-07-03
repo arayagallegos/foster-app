@@ -57,3 +57,30 @@ def test_lasso_started_emits_selected_set_op(app, qtbot):
     panel.lasso_started.connect(received.append)
     panel._btn_start_lasso.click()
     assert received == ["union"]
+
+
+def test_set_lasso_has_selection_acepta_numpy_bool(app):
+    """PyQt6 es estricto con los tipos: numpy.bool_ debe aceptarse igual."""
+    import numpy as np
+
+    from app.gui.panels.crop_panel import CropPanel
+    panel = CropPanel("test.ply")
+    panel.set_lasso_has_selection(np.bool_(True))
+    assert panel._btn_apply_lasso.isEnabled()
+
+
+def test_radio_actualiza_hint_y_emite_operacion(app, qtbot):
+    from app.gui.panels.crop_panel import CropPanel, LASSO_OPS
+    panel = CropPanel("test.ply")
+
+    # Elegir "Quitar (diferencia)" (tercer radio)
+    panel._lasso_op_group.buttons()[2].setChecked(True)
+    assert "QUITAN" in panel._lasso_hint.text()
+
+    received = []
+    panel.lasso_started.connect(received.append)
+    panel._btn_start_lasso.click()
+    assert received == ["difference"]
+
+    # Toda operacion tiene explicacion no vacia
+    assert all(ayuda for _l, _v, ayuda in LASSO_OPS)
