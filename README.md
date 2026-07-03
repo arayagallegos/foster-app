@@ -58,7 +58,7 @@ python main.py
 
 - [x] **Módulo 0** — Infraestructura base: viewer 3D, carga de archivos
 - [ ] **Módulo 1** — Fusión LiDAR + Fotogrametría (ICP)
-- [ ] **Módulo 2** — Procesamiento: filtrado, subsampling, edición
+- [~] **Módulo 2** — Procesamiento: recorte iterativo por capas (caja + lazo, preview verde/rojo, exportación de capas visibles); falta filtrado
 - [ ] **Módulo 3** — Reconstrucción de malla (Poisson)
 - [~] **Módulo 4** — Segmentación: RANSAC propio funcionando (suelo/tambor/cúpula + espesor de muro, validado con nube sintética); falta corrida real y DL
 - [~] **Módulo 5** — Exportación FEM: pipeline modal de prueba funcionando (FreeCAD→gmsh→CalculiX); falta geometría real
