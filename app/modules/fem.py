@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import glob
 import os
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+
+_SCRIPTS_DIR = Path(__file__).resolve().parents[2] / "scripts"
 
 
 # ------------------------------------------------------------------ #
@@ -67,8 +70,73 @@ def find_ccx() -> Path:
 
 
 # ------------------------------------------------------------------ #
+# Geometría (FreeCAD → .step)                                          #
+# ------------------------------------------------------------------ #
+
+def generate_toy_step(out_path: Path) -> Path:
+    """Genera la geometría de prueba ejecutando FreeCADCmd como subprocess."""
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    script = _SCRIPTS_DIR / "freecad_toy_geometry.py"
+    result = subprocess.run(
+        [str(find_freecadcmd()), str(script), str(out_path)],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0 or not out_path.exists():
+        raise RuntimeError(
+            f"FreeCADCmd falló (código {result.returncode}).\n"
+            f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
+        )
+    return out_path
+
+
+# ------------------------------------------------------------------ #
 # Malla → deck de análisis modal                                       #
 # ------------------------------------------------------------------ #
+
+@dataclass(frozen=True)
+class MeshInfo:
+    n_nodes: int
+    n_elements: int
+
+
+def mesh_step(step_path: Path, inp_path: Path, element_size: float = 0.4) -> MeshInfo:
+    """
+    Malla un .step con tetraedros cuadráticos (C3D10) y escribe un .inp Abaqus.
+    OCCTargetUnit="M" convierte los mm del STEP a metros (unidades SI del modelo).
+    """
+    import gmsh
+
+    inp_path = Path(inp_path)
+    inp_path.parent.mkdir(parents=True, exist_ok=True)
+    gmsh.initialize()
+    try:
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setString("Geometry.OCCTargetUnit", "M")
+        gmsh.model.occ.importShapes(str(step_path))
+        gmsh.model.occ.synchronize()
+
+        volumes = gmsh.model.getEntities(dim=3)
+        if not volumes:
+            raise RuntimeError(f"El STEP no contiene sólidos: {step_path}")
+        gmsh.model.addPhysicalGroup(3, [tag for _, tag in volumes], name="STRUCTURE")
+
+        gmsh.option.setNumber("Mesh.MeshSizeMin", element_size / 2)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", element_size)
+        gmsh.model.mesh.generate(3)
+        gmsh.model.mesh.setOrder(2)  # tets de 10 nodos → C3D10
+
+        node_tags, _, _ = gmsh.model.mesh.getNodes()
+        _, elem_tags, _ = gmsh.model.mesh.getElements(dim=3)
+        info = MeshInfo(
+            n_nodes=len(node_tags),
+            n_elements=sum(len(t) for t in elem_tags),
+        )
+        gmsh.write(str(inp_path))
+        return info
+    finally:
+        gmsh.finalize()
+
 
 def extract_base_nodes(inp_path: Path, tol: float = 1e-6) -> list[int]:
     """
@@ -133,6 +201,29 @@ def write_modal_deck(
     deck_path = Path(deck_path)
     deck_path.write_text("\n".join(lines))
     return deck_path
+
+
+# ------------------------------------------------------------------ #
+# Solver                                                               #
+# ------------------------------------------------------------------ #
+
+def run_ccx(deck_path: Path) -> Path:
+    """
+    Ejecuta CalculiX sobre el deck. ccx se invoca sin la extensión .inp y con
+    cwd en la carpeta del deck (el *INCLUDE de la malla es relativo).
+    """
+    deck_path = Path(deck_path)
+    result = subprocess.run(
+        [str(find_ccx()), "-i", deck_path.stem],
+        cwd=deck_path.parent, capture_output=True, text=True, timeout=600,
+    )
+    dat = deck_path.with_suffix(".dat")
+    if result.returncode != 0 or not dat.exists():
+        raise RuntimeError(
+            f"ccx falló (código {result.returncode}).\n"
+            f"stdout: {result.stdout[-2000:]}\nstderr: {result.stderr[-2000:]}"
+        )
+    return dat
 
 
 # ------------------------------------------------------------------ #

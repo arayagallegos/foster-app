@@ -132,3 +132,64 @@ def test_find_ccx_env_inexistente_lanza_error(monkeypatch):
     monkeypatch.setenv("FOSTER_CCX", r"C:\no\existe\ccx.exe")
     with pytest.raises(FileNotFoundError, match="FOSTER_CCX"):
         find_ccx()
+
+
+# ------------------------------------------------------------------ #
+# Tasks 5-7: etapas con herramientas externas (skip si no instaladas)  #
+# ------------------------------------------------------------------ #
+
+def _has_freecad() -> bool:
+    try:
+        find_freecadcmd()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _has_ccx() -> bool:
+    try:
+        find_ccx()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+@pytest.fixture(scope="session")
+def toy_step(tmp_path_factory):
+    if not _has_freecad():
+        pytest.skip("FreeCAD no instalado")
+    from app.modules.fem import generate_toy_step
+    return generate_toy_step(tmp_path_factory.mktemp("geom") / "toy.step")
+
+
+@pytest.mark.skipif(not _has_freecad(), reason="FreeCAD no instalado")
+def test_generate_toy_step_crea_archivo(toy_step):
+    assert toy_step.exists() and toy_step.stat().st_size > 1_000
+
+
+@pytest.mark.skipif(not (_has_freecad() and _has_ccx()),
+                    reason="requiere FreeCAD y ccx")
+def test_pipeline_completo_frecuencias_plausibles(toy_step, tmp_path):
+    from app.modules.fem import mesh_step, run_ccx
+    mesh_step(toy_step, tmp_path / "toy.inp", element_size=0.6)  # malla gruesa: rápido
+    base = extract_base_nodes(tmp_path / "toy.inp")
+    deck = write_modal_deck(tmp_path / "toy.inp", tmp_path / "modal.inp",
+                            base, MAMPOSTERIA_GENERICA, n_modes=5)
+    freqs = parse_frequencies(run_ccx(deck))
+    assert len(freqs) == 5
+    # Plausibilidad física: estructura de mampostería rígida y baja → entre 1 y 200 Hz
+    assert all(1.0 < f < 200.0 for f in freqs)
+    assert freqs == sorted(freqs)
+
+
+@pytest.mark.skipif(not _has_freecad(), reason="FreeCAD no instalado")
+def test_mesh_step_genera_inp_c3d10(toy_step, tmp_path):
+    from app.modules.fem import mesh_step
+    info = mesh_step(toy_step, tmp_path / "toy.inp", element_size=0.5)
+    text = (tmp_path / "toy.inp").read_text()
+    assert "C3D10" in text
+    assert "STRUCTURE" in text.upper()
+    assert info.n_nodes > 100 and info.n_elements > 100
+    # Debe haber nodos en la base (z=0) para poder empotrar
+    base = extract_base_nodes(tmp_path / "toy.inp")
+    assert len(base) > 10
