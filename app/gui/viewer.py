@@ -322,8 +322,23 @@ class Viewer3D(QWidget):
         self.plotter.renderer.AddActor2D(self._lasso_actor2d)
         self.plotter.render()
 
+    # Radio (px) para cerrar el lazo clicando sobre el primer vertice
+    LASSO_SNAP_PX = 15
+
     def _vtk_lasso_click(self, vtk_iren, event) -> None:
         x, y = vtk_iren.GetEventPosition()
+
+        if len(self._lasso_vtk_verts) >= 3:
+            # Doble clic (el adaptador Qt→VTK marca RepeatCount > 0)
+            if vtk_iren.GetRepeatCount() > 0:
+                self._vtk_lasso_close(vtk_iren, event)
+                return
+            # Clic sobre el primer vertice: unir inicio y final
+            x0, y0 = self._lasso_vtk_verts[0]
+            if abs(x - x0) + abs(y - y0) < self.LASSO_SNAP_PX:
+                self._vtk_lasso_close(vtk_iren, event)
+                return
+
         h = self.plotter.renderer.GetSize()[1]
         screen_y = h - y  # VTK: y=0 abajo → screen: y=0 arriba
 
@@ -369,6 +384,13 @@ class Viewer3D(QWidget):
             line = _vtk.vtkLine()
             line.GetPointIds().SetId(0, n - 1)
             line.GetPointIds().SetId(1, n)
+            self._lasso_cells2d.InsertNextCell(line)
+
+        # Borde de cierre: cursor → primer vertice, para ver el poligono unido
+        if n >= 2:
+            line = _vtk.vtkLine()
+            line.GetPointIds().SetId(0, n)   # cursor (ultimo punto insertado)
+            line.GetPointIds().SetId(1, 0)   # primer vertice
             self._lasso_cells2d.InsertNextCell(line)
 
         self._lasso_poly2d.Modified()
