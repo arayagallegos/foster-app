@@ -61,7 +61,7 @@ python main.py
 - [ ] **Módulo 2** — Procesamiento: filtrado, subsampling, edición
 - [ ] **Módulo 3** — Reconstrucción de malla (Poisson)
 - [ ] **Módulo 4** — Segmentación (RANSAC + DBSCAN + manual)
-- [ ] **Módulo 5** — Exportación FEM (gmsh + meshio)
+- [~] **Módulo 5** — Exportación FEM: pipeline modal de prueba funcionando (FreeCAD→gmsh→CalculiX); falta geometría real
 
 ---
 
