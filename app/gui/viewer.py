@@ -41,6 +41,10 @@ class Viewer3D(QWidget):
         self._setup_ui()
         self._active_actors: list[str] = []  # nombres de actors en la escena
         self._crop_widget = None
+        # Centro compartido de la escena: todos los actores (capas, previews)
+        # se dibujan restando este centro para quedar alineados.
+        self._scene_center: np.ndarray | None = None
+        self._dimmed_actor: str | None = None
         # Estado del lazo (VTK-based)
         self._lasso_callback = None
         self._lasso_obs_ids: list[int] = []
@@ -86,7 +90,8 @@ class Viewer3D(QWidget):
             f"[viewer] mostrando {n_display:,} de {n_original:,} puntos"
         )
 
-        poly = _o3d_to_pyvista(pcd_display)
+        self._scene_center = np.asarray(pcd_display.points).mean(axis=0)
+        poly = _o3d_to_pyvista(pcd_display, center=self._scene_center)
 
         print(
             "PolyData:",
@@ -222,7 +227,7 @@ class Viewer3D(QWidget):
             self.stop_crop_widget()
 
         pts = np.asarray(pcd.points)
-        center = pts.mean(axis=0)
+        center = self._scene_center if self._scene_center is not None else pts.mean(axis=0)
         pts_c = pts - center
         full_min = pts_c.min(axis=0)
         full_max = pts_c.max(axis=0)
@@ -354,9 +359,14 @@ class Viewer3D(QWidget):
 
     def _vtk_lasso_close(self, vtk_iren, event) -> None:
         verts = self._lasso_screen_verts.copy()
-        self._cleanup_lasso_2d()
-        if len(verts) >= 3 and self._lasso_callback:
-            self._lasso_callback(verts)
+        callback = self._lasso_callback
+        # Restaurar de inmediato el control de cámara: el usuario debe poder
+        # orbitar/zoomear para revisar el preview 3D antes de aplicar.
+        self.stop_lasso()
+        if callback:
+            # Siempre notificar (incluso con <3 vertices) para que la ventana
+            # principal restaure estados de UI; ella decide si el lazo es valido.
+            callback(verts)
 
     def _update_lasso_2d(self) -> None:
         import vtk as _vtk
@@ -439,7 +449,7 @@ class Viewer3D(QWidget):
         cam = renderer.GetActiveCamera()
 
         pts = np.asarray(pcd.points)
-        center = pts.mean(axis=0)
+        center = self._scene_center if self._scene_center is not None else pts.mean(axis=0)
         pts_c = (pts - center).astype(np.float64)
 
         def _mat4(m):
@@ -463,36 +473,102 @@ class Viewer3D(QWidget):
         sy = (1 - (ndc[:, 1] + 1) * 0.5) * h
         return np.column_stack([sx, sy]), valid
 
-    def highlight_selection(
+    # ------------------------------------------------------------------ #
+    # Previsualización verde/rojo y render por capas                       #
+    # ------------------------------------------------------------------ #
+
+    COLOR_KEEP = "#4caf50"     # verde: se conserva
+    COLOR_DISCARD = "#f44336"  # rojo: se elimina
+
+    def _add_points_actor(
+        self, pts: np.ndarray, name: str, color: str, point_size: float
+    ) -> None:
+        center = self._scene_center if self._scene_center is not None else 0.0
+        poly = pv.PolyData((pts - center).astype(np.float32))
+        self.plotter.add_mesh(
+            poly,
+            color=color,
+            point_size=point_size,
+            render_points_as_spheres=True,
+            style="points",
+            name=name,
+        )
+
+    def preview_split(
         self,
         pcd: o3d.geometry.PointCloud,
-        mask: np.ndarray,
-        source_actor_name: str = "cloud_lidar",
+        keep_mask: np.ndarray,
+        source_actor_name: str,
     ) -> None:
+        """
+        Previsualiza un recorte sobre la capa activa: VERDE = se conserva,
+        ROJO = se elimina. El actor fuente se atenúa para que dominen los colores.
+        """
+        keep_mask = np.asarray(keep_mask, dtype=bool)
         pts = np.asarray(pcd.points)
-        center = pts.mean(axis=0)
 
         actor = self.plotter.actors.get(source_actor_name)
         if actor is not None:
-            actor.GetProperty().SetOpacity(0.3)
+            actor.GetProperty().SetOpacity(0.15)
+            self._dimmed_actor = source_actor_name
 
-        selected = pts[mask] - center
+        for name, sel in (("_preview_keep", keep_mask), ("_preview_discard", ~keep_mask)):
+            if name in self.plotter.actors:
+                self.plotter.remove_actor(name)
+            if sel.any():
+                color = self.COLOR_KEEP if name == "_preview_keep" else self.COLOR_DISCARD
+                self._add_points_actor(pts[sel], name, color, point_size=4.0)
+        self.plotter.render()
 
-        if len(selected) == 0:
-            if "_lasso_selection" in self.plotter.actors:
-                self.plotter.remove_actor("_lasso_selection")
-            self.plotter.render()
-            return
+    def clear_preview(self) -> None:
+        """Quita los actores de previsualización y restaura la opacidad."""
+        for name in ("_preview_keep", "_preview_discard", "_lasso_selection"):
+            if name in self.plotter.actors:
+                self.plotter.remove_actor(name)
+        if self._dimmed_actor is not None:
+            actor = self.plotter.actors.get(self._dimmed_actor)
+            if actor is not None:
+                actor.GetProperty().SetOpacity(1.0)
+            self._dimmed_actor = None
+        self.plotter.render()
 
-        poly = pv.PolyData(selected.astype(np.float32))
-        self.plotter.add_mesh(
-            poly,
-            color="#ffeb3b",
-            point_size=4.0,
-            render_points_as_spheres=True,
-            style="points",
-            name="_lasso_selection",
-        )
+    def show_layers(self, stack) -> None:
+        """
+        Renderiza un actor por capa visible (layer_<i>). La capa activa a
+        opacidad plena, las demás a 0.5. Reemplaza a los actores legacy.
+        """
+        # Quitar actores de capas anteriores y nubes legacy
+        obsoletos = [
+            n for n in list(self.plotter.actors)
+            if n.startswith("layer_") or n in ("cloud_lidar", "cloud_cropped")
+        ]
+        for n in obsoletos:
+            self.plotter.remove_actor(n)
+            if n in self._active_actors:
+                self._active_actors.remove(n)
+
+        if self._scene_center is None and len(stack.layers) > 0:
+            self._scene_center = np.asarray(stack.layers[0].pcd.points).mean(axis=0)
+
+        for i, capa in enumerate(stack):
+            if not capa.visible:
+                continue
+            name = f"layer_{i}"
+            poly = _o3d_to_pyvista(capa.pcd, center=self._scene_center)
+            kwargs = dict(
+                point_size=2.0,
+                render_points_as_spheres=True,
+                style="points",
+                name=name,
+                opacity=1.0 if i == stack.active_index else 0.5,
+            )
+            if capa.pcd.has_colors():
+                self.plotter.add_mesh(poly, scalars="RGB", rgb=True, **kwargs)
+            else:
+                self.plotter.add_mesh(
+                    poly, scalars="z", cmap="viridis", show_scalar_bar=False, **kwargs
+                )
+            self._active_actors.append(name)
         self.plotter.render()
 
     def set_actor_visibility(self, name: str, visible: bool) -> None:
@@ -515,14 +591,20 @@ def _maybe_downsample(
 
 
 def _o3d_to_pyvista(
-    pcd: o3d.geometry.PointCloud
+    pcd: o3d.geometry.PointCloud,
+    center: np.ndarray | None = None,
 ) -> pv.PolyData:
-
+    """
+    Convierte a PolyData restando `center` (o la media propia si es None).
+    Todos los actores de una misma escena deben compartir el mismo centro
+    para quedar alineados entre sí.
+    """
     pts = np.asarray(
         pcd.points
     ).copy()
 
-    center = pts.mean(axis=0)
+    if center is None:
+        center = pts.mean(axis=0)
 
     print(
         "[viewer] centro original:",

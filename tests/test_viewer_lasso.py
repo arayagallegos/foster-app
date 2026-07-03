@@ -58,6 +58,23 @@ def test_lasso_clic_sobre_primer_vertice_cierra(viewer, qtbot):
     assert len(recibido[0]) == 3
 
 
+def test_camara_se_libera_al_cerrar_el_lazo(viewer, qtbot):
+    """Tras cerrar el polígono debe poder moverse la cámara (estilo restaurado)."""
+    from vtkmodules.vtkInteractionStyle import vtkInteractorStyleUser
+
+    viewer.start_lasso(lambda verts: None)
+    iren = viewer.plotter.iren.interactor
+    assert isinstance(iren.GetInteractorStyle(), vtkInteractorStyleUser)
+
+    _add_vertices(qtbot, viewer.plotter, [(100, 100), (300, 100), (200, 300)])
+    qtbot.mouseClick(viewer.plotter, Qt.MouseButton.RightButton, pos=QPoint(200, 150))
+
+    assert not isinstance(iren.GetInteractorStyle(), vtkInteractorStyleUser), (
+        "la cámara sigue bloqueada tras cerrar el lazo"
+    )
+    assert viewer._lasso_obs_ids == []
+
+
 def test_lasso_doble_clic_cierra(viewer, qtbot):
     """La barra de estado promete doble clic para cerrar: debe cumplirse."""
     recibido = []
