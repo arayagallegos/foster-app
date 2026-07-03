@@ -23,17 +23,18 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout,
     QSplitter, QToolBar, QStatusBar,
     QProgressBar, QLabel, QFileDialog,
-    QMessageBox, QApplication
+    QMessageBox, QApplication,
+    QMenu, QToolButton,
 )
 from PyQt6.QtCore import Qt, QSettings
-from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 
+from app.core.layers import LayerStack
 from app.core.project import Project
 from app.core.workers import LoadWorker
 from app.gui.viewer import Viewer3D
+from app.gui.panels.crop_dock import CropDock
 from app.gui.panels.info_panel import InfoPanel
-from app.gui.panels.crop_panel import CropPanel
-from app.modules.processing import crop_cloud
 
 
 class MainWindow(QMainWindow):
@@ -46,12 +47,12 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.project = Project()
         self.settings = QSettings("LabPatrimonio", "FosterApp")
-        self._crop_panel: CropPanel | None = None
+        self._crop_dock: CropDock | None = None
+        self._layer_stack: LayerStack | None = None
+        self._active_tool: str | None = None   # None | "caja" | "lazo"
         self._crop_min: np.ndarray | None = None
         self._crop_max: np.ndarray | None = None
-        self._lasso_source: o3d.geometry.PointCloud | None = None
         self._lasso_mask: np.ndarray | None = None
-        self._lasso_source_actor: str = "cloud_lidar"
         self._lasso_set_op: str = "union"
 
         self._setup_window()
@@ -126,14 +127,32 @@ class MainWindow(QMainWindow):
         act_front.triggered.connect(self.viewer.set_view_front)
         tb.addAction(act_front)
 
+        # Cambiar la vista con un lazo a medio dibujar mezclaría vértices de
+        # cámaras distintas: se bloquean mientras el lazo está activo.
+        self._acts_vista = (act_iso, act_top, act_front)
+
         tb.addSeparator()
 
-        # --- Recortar nube ---
-        self._act_crop = QAction("✂  Recortar", self)
-        self._act_crop.setToolTip("Recortar nube a una zona de interes")
-        self._act_crop.setEnabled(False)
-        self._act_crop.triggered.connect(self._on_crop)
-        tb.addAction(self._act_crop)
+        # --- Recortar nube (menú desplegable Caja / Lazo) ---
+        self._btn_crop = QToolButton()
+        self._btn_crop.setText("✂  Recortar")
+        self._btn_crop.setToolTip("Herramientas de recorte de la nube")
+        self._btn_crop.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._btn_crop.setEnabled(False)
+
+        menu_crop = QMenu(self._btn_crop)
+        grupo = QActionGroup(self)
+        grupo.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)
+        self._act_tool_caja = QAction("⬜  Caja", self, checkable=True)
+        self._act_tool_caja.setData("caja")
+        self._act_tool_lazo = QAction("➰  Lazo", self, checkable=True)
+        self._act_tool_lazo.setData("lazo")
+        for act in (self._act_tool_caja, self._act_tool_lazo):
+            grupo.addAction(act)
+            menu_crop.addAction(act)
+            act.triggered.connect(self._on_tool_action)
+        self._btn_crop.setMenu(menu_crop)
+        tb.addWidget(self._btn_crop)
 
         tb.addSeparator()
 
@@ -240,6 +259,40 @@ class MainWindow(QMainWindow):
             QSplitter::handle {
                 background-color: #444444;
             }
+            QPushButton {
+                background-color: #3c3c3c;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 5px 10px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                border-color: #777777;
+            }
+            QPushButton:pressed {
+                background-color: #2e75b6;
+            }
+            QPushButton:disabled {
+                color: #777777;
+                border-color: #444444;
+            }
+            QRadioButton {
+                spacing: 6px;
+            }
+            QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border-radius: 8px;
+                border: 2px solid #888888;
+                background-color: #2b2b2b;
+            }
+            QRadioButton::indicator:hover {
+                border-color: #cccccc;
+            }
+            QRadioButton::indicator:checked {
+                background-color: #4caf50;
+                border-color: #dddddd;
+            }
         """)
 
     # ------------------------------------------------------------------ #
@@ -296,20 +349,15 @@ class MainWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
-            if self._crop_panel is not None:
-                self.viewer.stop_crop_widget()
-                self._crop_panel.hide()
-                self._crop_panel = None
-            self._crop_min = None
-            self._crop_max = None
-            self._lasso_source = None
-            self._lasso_mask = None
-            self.viewer.stop_lasso()
+            self._deactivate_tools()
+            if self._crop_dock is not None:
+                self._crop_dock.hide()
+            self._layer_stack = None
             self.viewer.clear()
             self.project.clear()
             self.info_panel.update_from_project(self.project)
             self._points_label.setText("")
-            self._act_crop.setEnabled(False)
+            self._btn_crop.setEnabled(False)
             self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — Sin título")
             self.show_status("Escena limpiada.")
 
@@ -368,7 +416,9 @@ class MainWindow(QMainWindow):
             f"{self.APP_NAME} v{self.VERSION} — {self.project.name}"
         )
         self.show_status(f"Cargado: {path}")
-        self._act_crop.setEnabled(True)
+        self._btn_crop.setEnabled(True)
+        # Nube nueva: el stack de capas se reconstruye al activar una herramienta
+        self._layer_stack = None
 
     def _on_load_error(self, message: str):
         """Callback cuando la carga falla."""
@@ -410,130 +460,168 @@ class MainWindow(QMainWindow):
     # Recorte interactivo                                                  #
     # ------------------------------------------------------------------ #
 
-    def _on_crop(self) -> None:
-        """Activa el modo recorte: muestra el panel flotante y el box widget."""
-        source_cloud = self.project.fused_cloud or self.project.lidar_cloud
-        if source_cloud is None:
+    def _ensure_crop_dock(self) -> CropDock:
+        if self._crop_dock is None:
+            dock = CropDock(self)
+            dock.tool_apply.connect(self._on_box_apply)
+            dock.tool_cancel.connect(self._on_tool_cancel)
+            dock.lasso_started.connect(self._on_lasso_started)
+            dock.lasso_apply.connect(self._on_lasso_apply)
+            dock.lasso_cancel.connect(self._on_lasso_cancel)
+            dock.layer_visibility_changed.connect(self._on_layer_visibility)
+            dock.layer_activated.connect(self._on_layer_activated)
+            dock.layer_removed.connect(self._on_layer_removed)
+            dock.layer_restore_requested.connect(self._on_layer_restore)
+            dock.export_requested.connect(self._on_export_visible)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            self._crop_dock = dock
+        return self._crop_dock
+
+    def _ensure_layer_stack(self) -> bool:
+        """Crea el stack de capas desde la nube activa si aún no existe."""
+        source = self.project.fused_cloud or self.project.lidar_cloud
+        if source is None:
+            return False
+        if self._layer_stack is None:
+            self._layer_stack = LayerStack()
+            self._layer_stack.reset(source)
+            self.viewer.show_layers(self._layer_stack)
+        return True
+
+    def _on_tool_action(self) -> None:
+        """Handler de las acciones del menú Recortar (Caja/Lazo)."""
+        accion = self.sender()
+        if not accion.isChecked():
+            self._deactivate_tools()
+            self.show_status("Herramienta de recorte desactivada.")
             return
+        self._activate_tool(accion.data())
 
-        source_info = self.project.fused_info or self.project.lidar_info
-        source_name = source_info.name if source_info else "nube activa"
-
-        # Inicializar bounds con el bounding box completo de la nube
-        pts = np.asarray(source_cloud.points)
-        self._crop_min = pts.min(axis=0)
-        self._crop_max = pts.max(axis=0)
-
-        # Recrear el panel siempre: evita instancias viejas superpuestas y
-        # estados obsoletos (nombre de fuente, checkboxes post-crop, etc.)
-        if self._crop_panel is not None:
-            self._crop_panel.hide()
-            self._crop_panel.deleteLater()
-        self._crop_panel = CropPanel(source_name, parent=self)
-        self._crop_panel.apply_requested.connect(self._on_crop_apply)
-        self._crop_panel.cancel_requested.connect(self._on_crop_cancel)
-        self._crop_panel.export_requested.connect(self._on_crop_export)
-        self._crop_panel.visibility_changed.connect(self._on_crop_visibility)
-        self._crop_panel.lasso_started.connect(self._on_lasso_started)
-        self._crop_panel.lasso_apply_requested.connect(self._on_lasso_apply)
-        self._crop_panel.lasso_cancel_requested.connect(self._on_lasso_cancel)
-
-        viewer_pos = self.viewer.mapTo(self, self.viewer.rect().topLeft())
-        self._crop_panel.move(viewer_pos.x() + 10, viewer_pos.y() + 10)
-        self._crop_panel.show()
-        self._crop_panel.raise_()
-
-        self.viewer.start_crop_widget(
-            source_cloud,
-            callback=self._on_crop_bounds_changed,
-        )
-        self.show_status("Ajusta la caja en el viewer y presiona Aplicar.")
-
-    def _on_crop_bounds_changed(
-        self,
-        min_bound: np.ndarray,
-        max_bound: np.ndarray,
-    ) -> None:
-        """Callback del viewer: actualiza los bounds actuales del widget."""
-        self._crop_min = min_bound
-        self._crop_max = max_bound
-
-    def _on_crop_apply(self) -> None:
-        """Aplica el recorte con los bounds actuales del widget."""
-        source_cloud = self.project.fused_cloud or self.project.lidar_cloud
-        if source_cloud is None or self._crop_min is None:
+    def _activate_tool(self, tool: str) -> None:
+        if not self._ensure_layer_stack():
+            for act in (self._act_tool_caja, self._act_tool_lazo):
+                act.setChecked(False)
             return
+        self._deactivate_tools(keep_checked=tool)
+        dock = self._ensure_crop_dock()
+        dock.set_tool(tool)
+        dock.refresh_layers(self._layer_stack)
+        dock.show()
+        self._active_tool = tool
+        if tool == "caja":
+            self.viewer.start_crop_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_crop_bounds_changed,
+            )
+            self.show_status("Ajusta la caja: VERDE se conserva, ROJO se elimina.")
+        else:
+            self.show_status(
+                "Elige la operacion y pulsa 'Iniciar lazo' en el panel Recorte."
+            )
 
-        try:
-            result = crop_cloud(source_cloud, self._crop_min, self._crop_max)
-        except ValueError:
-            self.show_status("La seleccion no contiene puntos. Ajusta la caja.")
-            return
-
-        self.project.set_cropped(result)
-        self.viewer.show_cloud(result, name="cloud_cropped", point_size=2.0, replace=True)
-        self.viewer.set_actor_visibility("cloud_lidar", True)
-
-        if self._crop_panel is not None:
-            self._crop_panel.show_visibility_controls()
-
-        n = len(result.points)
-        self.show_status(
-            f"Recorte aplicado: {n:,} puntos. "
-            "Ajusta la caja o presiona Cancelar para salir."
-        )
-
-    def _on_crop_cancel(self) -> None:
-        """Cancela el modo recorte y cierra el panel."""
+    def _deactivate_tools(self, keep_checked: str | None = None) -> None:
+        """Detiene caja y lazo, limpia previews y desmarca las acciones del menú."""
+        for act in self._acts_vista:
+            act.setEnabled(True)
         self.viewer.stop_crop_widget()
-        if self._crop_panel is not None:
-            self._crop_panel.hide()
-            self._crop_panel = None
+        self.viewer.stop_lasso()
+        self.viewer.clear_preview()
+        self._lasso_mask = None
         self._crop_min = None
         self._crop_max = None
-        self.show_status("Recorte cancelado.")
+        self._active_tool = None
+        if self._crop_dock is not None:
+            self._crop_dock.set_lasso_active(False)
+            self._crop_dock.set_lasso_has_selection(False)
+        for act in (self._act_tool_caja, self._act_tool_lazo):
+            if act.data() != keep_checked:
+                act.setChecked(False)
 
-    def _on_crop_visibility(self, show_original: bool, show_cropped: bool) -> None:
-        """Muestra u oculta las nubes segun los checkboxes del panel."""
-        self.viewer.set_actor_visibility("cloud_lidar", show_original)
-        self.viewer.set_actor_visibility("cloud_cropped", show_cropped)
-
-    def _on_crop_export(self) -> None:
-        """Abre dialogo para guardar la nube recortada como .ply."""
-        from app.core.io import export_point_cloud
-        pcd = self.project.cropped_cloud
-        if pcd is None:
+    def _apply_split(self, keep_mask: np.ndarray) -> None:
+        """Núcleo común de Aplicar (caja y lazo): divide la capa activa."""
+        stack = self._layer_stack
+        if stack is None or keep_mask is None:
             return
-        last_dir = self.settings.value("io/last_dir", os.path.expanduser("~"))
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Exportar nube recortada", last_dir, "PLY (*.ply)"
-        )
-        if not path:
-            return
-        if not path.lower().endswith(".ply"):
-            path += ".ply"
+        fuente_nombre = stack.active.name
         try:
-            export_point_cloud(pcd, path)
-            self.settings.setValue("io/last_dir", os.path.dirname(path))
-            self.show_status(f"Nube recortada exportada: {path}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error al exportar", str(e))
+            recorte, descarte = stack.split_active(keep_mask)
+        except ValueError as e:
+            # Nada que separar (todo verde o todo rojo): limpiar el preview
+            # para no dejar la capa pintada, y partir de cero.
+            self.viewer.stop_lasso()
+            self.viewer.clear_preview()
+            self._lasso_mask = None
+            dock = self._ensure_crop_dock()
+            dock.set_lasso_active(False)
+            dock.set_lasso_has_selection(False)
+            self.show_status(str(e))
+            return
+
+        self._lasso_mask = None
+        self.viewer.stop_lasso()
+        self.viewer.clear_preview()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.set_lasso_active(False)
+        dock.set_lasso_has_selection(False)
+
+        if self._active_tool == "caja":
+            self.viewer.start_crop_widget(
+                stack.active.pcd, callback=self._on_crop_bounds_changed
+            )
+
+        self.show_status(
+            f"'{fuente_nombre}' quedó oculta e intacta. Nueva capa activa "
+            f"'{recorte.name}' ({len(recorte.pcd.points):,} pts); "
+            f"'{descarte.name}' ({len(descarte.pcd.points):,} pts) oculta."
+        )
+
+    # ---------- herramienta caja ---------- #
+
+    def _box_keep_mask(self) -> np.ndarray | None:
+        if self._layer_stack is None or self._crop_min is None:
+            return None
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        return np.all((pts >= self._crop_min) & (pts <= self._crop_max), axis=1)
+
+    def _on_crop_bounds_changed(
+        self, min_bound: np.ndarray, max_bound: np.ndarray
+    ) -> None:
+        """Callback del box widget: preview verde (dentro) / rojo (fuera)."""
+        self._crop_min = min_bound
+        self._crop_max = max_bound
+        stack = self._layer_stack
+        keep = self._box_keep_mask()
+        if stack is None or keep is None:
+            return
+        self.viewer.preview_split(
+            stack.active.pcd, keep, f"layer_{stack.active_index}"
+        )
+
+    def _on_box_apply(self) -> None:
+        keep = self._box_keep_mask()
+        if keep is None:
+            return
+        self._apply_split(keep)
+
+    def _on_tool_cancel(self) -> None:
+        self._deactivate_tools()
+        self.show_status("Herramienta de recorte cancelada.")
+
+    # ---------- herramienta lazo ---------- #
 
     def _on_lasso_started(self, set_op: str) -> None:
-        source = self.project.cropped_cloud or self.project.lidar_cloud
-        if source is None:
+        if self._layer_stack is None:
             return
-        self._lasso_source = source
-        self._lasso_source_actor = (
-            "cloud_cropped" if self.project.cropped_cloud is not None else "cloud_lidar"
-        )
         self._lasso_set_op = set_op
         if self._lasso_mask is None:
-            self._lasso_mask = np.zeros(len(source.points), dtype=bool)
-
-        if self._crop_panel is not None:
-            self._crop_panel.set_lasso_active(True)
-
+            self._lasso_mask = np.zeros(
+                len(self._layer_stack.active.pcd.points), dtype=bool
+            )
+        self._ensure_crop_dock().set_lasso_active(True)
+        for act in self._acts_vista:
+            act.setEnabled(False)
         self.viewer.start_lasso(self._on_lasso_polygon_closed)
         self.show_status(
             "Haz clic para agregar vertices. Cierra el lazo con clic derecho, "
@@ -541,87 +629,177 @@ class MainWindow(QMainWindow):
         )
 
     def _on_lasso_polygon_closed(self, verts: list[tuple[int, int]]) -> None:
-        if self._lasso_source is None:
+        if self._layer_stack is None or self._lasso_mask is None:
             return
 
         from app.modules.processing import apply_lasso
 
-        screen_pts, valid = self.viewer.project_cloud_to_screen(self._lasso_source)
+        for act in self._acts_vista:
+            act.setEnabled(True)
 
-        # Sin seleccion previa, Quitar/Intersectar parten de la nube completa:
+        if len(verts) < 3:
+            self._ensure_crop_dock().set_lasso_active(False)
+            self.show_status("Lazo descartado: se necesitan al menos 3 vertices.")
+            return
+
+        activa = self._layer_stack.active
+        screen_pts, valid = self.viewer.project_cloud_to_screen(activa.pcd)
+
+        # Diagnóstico visible: cuántos centros de puntos caen dentro del polígono
+        from matplotlib.path import Path as _MplPath
+        n_dentro = int((_MplPath(verts).contains_points(screen_pts) & valid).sum())
+        print(f"[lazo] vertices={len(verts)}, puntos dentro del poligono={n_dentro:,}, "
+              f"op={self._lasso_set_op}, capa='{activa.name}' ({len(screen_pts):,} pts)")
+
+        # Sin seleccion previa, Quitar/Intersectar parten de la capa completa:
         # "quitar estos puntos" significa "todo menos esto".
         mask_base = self._lasso_mask
         if not mask_base.any() and self._lasso_set_op in ("difference", "intersection"):
             mask_base = np.ones(len(mask_base), dtype=bool)
 
+        dock = self._ensure_crop_dock()
         try:
             new_mask = apply_lasso(
                 screen_pts, valid, verts, self._lasso_set_op, mask_base
             )
         except ValueError as e:
             self.show_status(str(e))
-            if self._crop_panel is not None:
-                self._crop_panel.set_lasso_active(False)
+            dock.set_lasso_active(False)
             return
 
         if not new_mask.any():
-            self.show_status("La operacion no selecciono puntos. Mascara sin cambios.")
+            self.show_status(
+                f"Lazo: {n_dentro:,} pts dentro del poligono; la operacion dejo la "
+                "seleccion vacia. Seleccion sin cambios."
+            )
         else:
             self._lasso_mask = new_mask
-            n = int(new_mask.sum())
-            self.show_status(f"Lazo: {n:,} puntos seleccionados.")
-
-        if self._crop_panel is not None:
-            self._crop_panel.set_lasso_active(False)
-            self._crop_panel.set_lasso_has_selection(
-                bool(self._lasso_mask is not None and self._lasso_mask.any())
+            self.show_status(
+                f"Lazo: {n_dentro:,} pts dentro del poligono → "
+                f"{int(new_mask.sum()):,} en verde. Puedes mover la camara para "
+                "revisar; 'Aplicar recorte' confirma."
             )
 
-        self.viewer.highlight_selection(
-            self._lasso_source, self._lasso_mask, self._lasso_source_actor
+        dock.set_lasso_active(False)
+        dock.set_lasso_has_selection(bool(self._lasso_mask.any()))
+        self.viewer.preview_split(
+            activa.pcd, self._lasso_mask,
+            f"layer_{self._layer_stack.active_index}",
         )
 
     def _on_lasso_apply(self) -> None:
-        if self._lasso_source is None or self._lasso_mask is None:
-            return
-        if not self._lasso_mask.any():
+        if self._lasso_mask is None or not self._lasso_mask.any():
             self.show_status("No hay puntos seleccionados.")
             return
-
-        pts = np.asarray(self._lasso_source.points)[self._lasso_mask]
-        result = o3d.geometry.PointCloud()
-        result.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-
-        if self._lasso_source.has_colors():
-            cols = np.asarray(self._lasso_source.colors)[self._lasso_mask]
-            result.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
-
-        self.project.set_cropped(result)
-        self.viewer.stop_lasso()
-        self.viewer.show_cloud(result, name="cloud_cropped", point_size=2.0, replace=True)
-        self.viewer.set_actor_visibility("cloud_lidar", True)
-
-        self._lasso_source = None
-        self._lasso_mask = None
-
-        if self._crop_panel is not None:
-            self._crop_panel.set_lasso_active(False)
-            self._crop_panel.set_lasso_has_selection(False)
-            self._crop_panel.show_visibility_controls()
-
-        n = len(result.points)
-        self.show_status(
-            f"Lazo aplicado: {n:,} puntos. Exporta con 'Exportar recorte (.ply)'."
-        )
+        self._apply_split(self._lasso_mask)
 
     def _on_lasso_cancel(self) -> None:
+        for act in self._acts_vista:
+            act.setEnabled(True)
         self.viewer.stop_lasso()
-        self._lasso_source = None
+        self.viewer.clear_preview()
         self._lasso_mask = None
-        if self._crop_panel is not None:
-            self._crop_panel.set_lasso_active(False)
-            self._crop_panel.set_lasso_has_selection(False)
+        dock = self._ensure_crop_dock()
+        dock.set_lasso_active(False)
+        dock.set_lasso_has_selection(False)
         self.show_status("Lazo cancelado.")
+
+    # ---------- capas ---------- #
+
+    def _on_layer_visibility(self, i: int, visible: bool) -> None:
+        if self._layer_stack is None:
+            return
+        self._layer_stack.set_visible(i, visible)
+        self.viewer.show_layers(self._layer_stack)
+
+    def _on_layer_activated(self, i: int) -> None:
+        stack = self._layer_stack
+        if stack is None or i == stack.active_index:
+            return
+        stack.set_active(i)
+        self._lasso_mask = None
+        self.viewer.stop_lasso()
+        self.viewer.clear_preview()
+        dock = self._ensure_crop_dock()
+        dock.set_lasso_active(False)
+        dock.set_lasso_has_selection(False)
+        self.viewer.show_layers(stack)
+        if self._active_tool == "caja":
+            self.viewer.start_crop_widget(
+                stack.active.pcd, callback=self._on_crop_bounds_changed
+            )
+        self.show_status(f"Capa activa: '{stack.active.name}'.")
+
+    def _on_layer_removed(self, i: int) -> None:
+        stack = self._layer_stack
+        if stack is None:
+            return
+        capa = stack.layers[i]
+        n = len(capa.pcd.points)
+        reply = QMessageBox.question(
+            self,
+            "Eliminar capa",
+            f"¿Eliminar la capa '{capa.name}' ({n:,} puntos)?\n"
+            "Podrás deshacerlo con 'Restaurar eliminada' mientras no elimines otra.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            stack.remove(i)
+        except ValueError as e:
+            self.show_status(str(e))
+            return
+        self._removed_layer_backup = (i, capa)
+        self._lasso_mask = None
+        self.viewer.clear_preview()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.set_restore_available(True)
+        self.show_status(f"Capa '{capa.name}' eliminada (puedes restaurarla).")
+
+    def _on_layer_restore(self) -> None:
+        stack = self._layer_stack
+        backup = getattr(self, "_removed_layer_backup", None)
+        if stack is None or backup is None:
+            return
+        i, capa = backup
+        stack.insert_layer(i, capa)
+        self._removed_layer_backup = None
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.set_restore_available(False)
+        self.show_status(f"Capa '{capa.name}' restaurada.")
+
+    def _on_export_visible(self) -> None:
+        """Une las capas visibles y las exporta a un único .ply."""
+        from app.core.io import export_point_cloud
+        if self._layer_stack is None:
+            return
+        try:
+            merged = self._layer_stack.merge_visible()
+        except ValueError as e:
+            self.show_status(str(e))
+            return
+        last_dir = self.settings.value("io/last_dir", os.path.expanduser("~"))
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar capas visibles", last_dir, "PLY (*.ply)"
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".ply"):
+            path += ".ply"
+        try:
+            export_point_cloud(merged, path)
+            self.settings.setValue("io/last_dir", os.path.dirname(path))
+            self.show_status(
+                f"Exportadas {len(merged.points):,} pts de capas visibles: {path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Error al exportar", str(e))
 
     # ------------------------------------------------------------------ #
     # Persistencia                                                         #
