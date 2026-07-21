@@ -54,6 +54,30 @@ python main.py
 
 ---
 
+## Librerías y su rol
+
+| Librería | Rol en el proyecto | Usada en |
+|---|---|---|
+| **PyQt6** | Framework de interfaz gráfica (ventana, botones, menús, paneles) | `app/gui/` |
+| **PyVista** | Visualización 3D interactiva de la nube (envoltorio amigable de VTK) | `app/gui/viewer.py` |
+| **pyvistaqt** | Pegamento: incrusta el visor 3D de PyVista dentro de una ventana PyQt6 | `app/gui/viewer.py` |
+| **Open3D** | Procesamiento de nubes de puntos: carga, downsampling, RANSAC de plano, I/O de `.ply` | `core/io.py`, `modules/segmentation.py`, `modules/processing.py` |
+| **NumPy** | Base del cálculo numérico (arreglos/matrices); la usan casi todas las demás por debajo | transversal |
+| **SciPy** | Herramientas científicas sobre NumPy (álgebra lineal, optimización, espacial) | apoyo numérico |
+| **laspy** | Lectura/escritura del formato LiDAR LAS/LAZ | `core/io.py` |
+| **pye57** | Lectura del formato E57 scan-por-scan (permite abrir el archivo de 25 GB sin cargarlo entero) | `core/io.py` |
+| **gmsh** | Mallado de elementos finitos: lee el `.step` y genera la malla tetraédrica (C3D10) | `modules/fem.py` |
+| **matplotlib** | Solo `matplotlib.path.Path`: prueba de punto-en-polígono para la selección por lazo | `modules/processing.py` |
+
+**Herramientas externas (no son librerías pip, se instalan aparte):**
+
+| Herramienta | Rol | Cómo se invoca |
+|---|---|---|
+| **FreeCAD** | Genera la geometría sólida paramétrica y la exporta a `.step` | `FreeCADCmd.exe` como subproceso (usa su propio intérprete Python, no el venv) |
+| **CalculiX** | Solver FEM open source (análisis modal); compatible con el formato Abaqus | `ccx.exe` como subproceso (viene en el `bin` de FreeCAD) |
+
+---
+
 ## Módulos (estado de desarrollo)
 
 - [x] **Módulo 0** — Infraestructura base: viewer 3D, carga de archivos
