@@ -80,7 +80,7 @@ python main.py
 
 ## Módulos (estado de desarrollo)
 
-- [x] **Módulo 0** — Infraestructura base: viewer 3D, carga de archivos
+- [x] **Módulo 0** — Infraestructura base: viewer 3D, carga de archivos, carga del .e57 por scans como capas activables (caché de dos resoluciones)
 - [ ] **Módulo 1** — Fusión LiDAR + Fotogrametría (ICP)
 - [~] **Módulo 2** — Procesamiento: recorte iterativo por capas (caja + lazo, preview verde/rojo, exportación de capas visibles); falta filtrado
 - [ ] **Módulo 3** — Reconstrucción de malla (Poisson)
