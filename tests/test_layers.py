@@ -25,6 +25,34 @@ def _stack_con_split(n=100, n_keep=60):
     return stack, recorte, descarte
 
 
+def test_merge_visible_fine_usa_los_ply_de_disco(tmp_path):
+    def _mk(idx, n_fino):
+        rng = np.random.default_rng(idx)
+        fino = o3d.geometry.PointCloud(
+            o3d.utility.Vector3dVector(rng.uniform(0, 5, (n_fino, 3))))
+        fp = tmp_path / f"scan_{idx:02d}.ply"
+        o3d.io.write_point_cloud(str(fp), fino)
+        grueso = fino.voxel_down_sample(0.5)   # menos puntos
+        return CloudLayer(name=f"Scan {idx}", pcd=grueso, fine_path=fp)
+
+    stack = LayerStack()
+    stack.layers = [_mk(0, 4000), _mk(1, 4000)]
+    stack.active_index = 0
+    stack.layers[1].visible = False            # apagar el scan 1
+
+    merged = stack.merge_visible_fine()
+    # usa el FINO del scan 0 (4000), no el grueso en memoria
+    assert len(merged.points) > len(stack.layers[0].pcd.points)
+    assert 3000 < len(merged.points) <= 4000   # solo el scan 0 visible
+
+
+def test_merge_visible_fine_sin_fine_path_usa_memoria():
+    stack = LayerStack()
+    stack.reset(_pcd(100))                      # capa normal, sin fine_path
+    merged = stack.merge_visible_fine()
+    assert len(merged.points) == 100
+
+
 def test_cloudlayer_acepta_fine_path(tmp_path):
     p = tmp_path / "scan_00.ply"
     capa = CloudLayer(name="Scan 00", pcd=_pcd(10), fine_path=p)

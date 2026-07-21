@@ -114,6 +114,27 @@ class LayerStack:
             out.colors = o3d.utility.Vector3dVector(cols)
         return out
 
+    def merge_visible_fine(self) -> o3d.geometry.PointCloud:
+        """
+        Como merge_visible, pero usa el .ply fino de disco (fine_path) cuando existe.
+        Para capas sin fine_path usa los puntos en memoria.
+        """
+        visibles = [c for c in self.layers if c.visible]
+        if not visibles:
+            raise ValueError("Ninguna capa visible que exportar.")
+        pcds = []
+        for c in visibles:
+            if c.fine_path is not None and Path(c.fine_path).exists():
+                pcds.append(o3d.io.read_point_cloud(str(c.fine_path)))
+            else:
+                pcds.append(c.pcd)
+        pts = np.vstack([np.asarray(p.points) for p in pcds])
+        out = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        if all(p.has_colors() for p in pcds):
+            cols = np.vstack([np.asarray(p.colors) for p in pcds])
+            out.colors = o3d.utility.Vector3dVector(cols)
+        return out
+
     def __len__(self) -> int:
         return len(self.layers)
 
