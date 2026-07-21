@@ -16,6 +16,7 @@ Layout:
 
 from __future__ import annotations
 import os
+from pathlib import Path
 
 import numpy as np
 import open3d as o3d
@@ -101,6 +102,14 @@ class MainWindow(QMainWindow):
         )
         self._act_register.triggered.connect(self._on_register_scans)
         tb.addAction(self._act_register)
+
+        # --- Cargar scans del e57 como capas ---
+        self._act_load_scan_layers = QAction("🗂  Cargar scans (capas)", self)
+        self._act_load_scan_layers.setToolTip(
+            "Cargar el .e57 como una capa por scan (activa/desactiva scans interiores)"
+        )
+        self._act_load_scan_layers.triggered.connect(self._on_load_scan_layers)
+        tb.addAction(self._act_load_scan_layers)
 
         # --- Cargar Fotogrametría ---
         self._act_load_photo = QAction("📷  Cargar Fotogrametría", self)
@@ -338,6 +347,48 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._load_cloud(path, cloud_type="photo")
+
+    def _on_load_scan_layers(self) -> None:
+        """Carga el .e57 como una capa por scan (con caché de dos resoluciones)."""
+        path = self._open_file_dialog("Cargar scans del .e57 como capas")
+        if not path:
+            return
+        if not path.lower().endswith(".e57"):
+            self.show_status("Selecciona un archivo .e57.")
+            return
+        cache_dir = Path("output/scans_cache") / Path(path).stem
+        self.show_status("Cargando scans (1ª vez puede tardar; luego usa caché)...")
+        self._set_loading(True)
+
+        from app.core.workers import ScanLayersWorker
+        worker = ScanLayersWorker(path, cache_dir, parent=self)
+        worker.progress.connect(self._progress.setValue)
+        worker.status.connect(self.show_status)
+        worker.finished.connect(self._on_scan_layers_loaded)
+        worker.error.connect(self._on_load_error)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_scan_layers_loaded(self, scans) -> None:
+        """Puebla el LayerStack con una capa por scan (versión gruesa + fine_path)."""
+        from app.core.layers import CloudLayer, LayerStack
+        self._set_loading(False)
+        stack = LayerStack()
+        stack.layers = [
+            CloudLayer(name=f"Scan {s.index:02d} ({s.n_pts_fino:,} pts)",
+                       pcd=s.pcd_grueso, fine_path=s.fine_path)
+            for s in scans
+        ]
+        stack.active_index = 0
+        self._layer_stack = stack
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.show()
+        self._btn_crop.setEnabled(True)
+        self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — scans")
+        self.show_status(f"{len(scans)} scans cargados como capas. "
+                         "Apaga los interiores y usa 'Exportar visibles'.")
 
     def _on_clear(self):
         """Limpia la escena y reinicia el proyecto."""
@@ -780,7 +831,7 @@ class MainWindow(QMainWindow):
         if self._layer_stack is None:
             return
         try:
-            merged = self._layer_stack.merge_visible()
+            merged = self._layer_stack.merge_visible_fine()
         except ValueError as e:
             self.show_status(str(e))
             return
@@ -796,7 +847,8 @@ class MainWindow(QMainWindow):
             export_point_cloud(merged, path)
             self.settings.setValue("io/last_dir", os.path.dirname(path))
             self.show_status(
-                f"Exportadas {len(merged.points):,} pts de capas visibles: {path}"
+                f"Exportadas {len(merged.points):,} pts de capas visibles "
+                f"(resolución fina): {path}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Error al exportar", str(e))
