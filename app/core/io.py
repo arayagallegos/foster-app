@@ -141,6 +141,12 @@ class ScanCacheInfo:
     pcd_grueso: o3d.geometry.PointCloud    # versión gruesa para el visor
 
 
+def _e57_scan_count(path: str) -> int:
+    """Número de scans del .e57 leyendo solo el header (barato)."""
+    import pye57
+    return int(pye57.E57(str(path)).scan_count)
+
+
 def _scans_desde_cache(cache_dir: Path, voxel_grueso: float) -> list[ScanCacheInfo]:
     """Carga scans ya cacheados (scan_NN.ply) sin tocar el .e57."""
     cache_dir = Path(cache_dir)

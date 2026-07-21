@@ -47,6 +47,14 @@ def _intentar_escribir_e57(path: Path) -> bool:
         return False
 
 
+def test_e57_scan_count(tmp_path):
+    e57 = tmp_path / "mini.e57"
+    if not _intentar_escribir_e57(e57):
+        pytest.skip("pye57 no pudo escribir un .e57 de prueba")
+    from app.core.io import _e57_scan_count
+    assert _e57_scan_count(str(e57)) == 2
+
+
 def test_load_e57_scans_cached_e2e(tmp_path):
     e57 = tmp_path / "mini.e57"
     if not _intentar_escribir_e57(e57):
