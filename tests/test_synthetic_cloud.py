@@ -1,0 +1,50 @@
+"""tests/test_synthetic_cloud.py — La nube sintética enriquecida."""
+import numpy as np
+
+from tests.synthetic_cloud import (
+    H_MURO, R_TAMBOR, make_synthetic_foster, make_synthetic_foster_dificil,
+)
+
+
+def test_defaults_igual_que_nube_simple():
+    # sin activar nada, la composición base sigue siendo suelo/tambor/cupula(+outliers)
+    pts, labels = make_synthetic_foster(seed=0)
+    assert set(np.unique(labels)) == {0, 1, 2, 3}
+    suelo = pts[labels == 1]
+    assert np.allclose(suelo[:, 2], 0.0, atol=0.05)     # suelo plano en z=0
+
+
+def test_pendiente_suelo_inclina_el_plano():
+    pts, labels = make_synthetic_foster(seed=1, pendiente_suelo_deg=5.0,
+                                        outlier_frac=0.0)
+    suelo = pts[labels == 1]
+    # con 5° de pendiente, z del suelo ya no es constante
+    assert suelo[:, 2].std() > 0.05
+    # la pendiente esperada ~ tan(5°) * radio
+    assert suelo[:, 2].max() - suelo[:, 2].min() > 0.3
+
+
+def test_contrafuertes_e_interior_son_resto():
+    pts, labels = make_synthetic_foster(seed=2, n_contrafuertes=4, n_interior=500,
+                                        outlier_frac=0.0)
+    # los puntos añadidos tienen etiqueta 0 (resto)
+    assert (labels == 0).sum() >= 500
+
+
+def test_junta_realista_tiene_falda_bajo_el_ecuador():
+    pts, labels = make_synthetic_foster(seed=3, junta_realista=True, outlier_frac=0.0)
+    cupula = pts[labels == 3]
+    # el mecanismo clave: hay puntos de cúpula POR DEBAJO del ecuador (z < H_MURO),
+    # que es donde el corte rígido z=sz los misclasifica como tambor
+    falda = cupula[cupula[:, 2] < H_MURO]
+    assert len(falda) > 0
+    # y sobresale levemente del tambor (overhang)
+    r_base = np.hypot(cupula[:, 0], cupula[:, 1])
+    assert r_base.max() > R_TAMBOR
+
+
+def test_dificil_activa_todo_y_es_reproducible():
+    a_pts, a_lab = make_synthetic_foster_dificil(seed=7)
+    b_pts, b_lab = make_synthetic_foster_dificil(seed=7)
+    assert np.array_equal(a_pts, b_pts) and np.array_equal(a_lab, b_lab)
+    assert len(a_pts) > 20_000

@@ -146,3 +146,22 @@ def test_save_segments_escribe_nube_completa_coloreada(tmp_path):
     assert pcd.has_colors()
     colores_unicos = np.unique(np.asarray(pcd.colors), axis=0)
     assert len(colores_unicos) >= 2   # al menos dos clases presentes
+
+
+# ------------------------------------------------------------------ #
+# Fase 1: línea base sobre la nube difícil (documenta el problema)     #
+# ------------------------------------------------------------------ #
+
+def test_linea_base_dificil_tiene_confusion_cupula_tambor():
+    from app.modules.segmentation import segment_foster
+    from app.modules.segmentation_metrics import evaluate
+    from tests.synthetic_cloud import make_synthetic_foster_dificil
+
+    pts, truth = make_synthetic_foster_dificil(seed=11)
+    res = segment_foster(pts)
+    m = evaluate(res.labels, truth, n_classes=4)
+    # Documenta el problema: en la línea base, cúpula(3) y tambor(2) se confunden
+    # -> hay puntos cuya verdad es cúpula pero se predicen tambor (confusion[3,2]>0).
+    assert m.confusion[3, 2] > 0
+    # macro IoU de partida está por debajo de lo perfecto (hay margen que mejorar)
+    assert m.macro_iou < 0.95
