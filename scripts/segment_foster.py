@@ -13,20 +13,31 @@ import open3d as o3d
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.modules.segmentation import save_segments, segment_foster  # noqa: E402
-
+from app.modules.segmentation import (  # noqa: E402
+    SegmentationConfig,
+    save_segments,
+    segment_foster,
+)
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Segmentacion RANSAC del Observatorio")
     ap.add_argument("nube", help="ruta a la nube ROI (.ply/.pcd)")
     ap.add_argument("--out", default="output/segmentation")
+    ap.add_argument("--eps-plano", type=float, default=0.05,help="tolerancia del plano de suelo [m] (default 0.05)")
+    ap.add_argument("--eps-circulo", type=float, default=0.05,help="tolerancia del circulo del tambor [m] (default 0.05)")
+    ap.add_argument("--eps-esfera", type=float, default=0.08,help="tolerancia de la esfera de la cupula [m] (default 0.08)")
     args = ap.parse_args()
 
     pcd = o3d.io.read_point_cloud(args.nube)
     pts = np.asarray(pcd.points)
     print(f"Nube: {len(pts):,} puntos")
 
-    res = segment_foster(pts)
+    config = SegmentationConfig(
+        eps_plano=args.eps_plano,
+        eps_circulo=args.eps_circulo,
+        eps_esfera=args.eps_esfera,
+    )
+    res = segment_foster(pts, config)
     for valor, nombre in ((0, "resto"), (1, "suelo"), (2, "tambor"), (3, "cupula")):
         print(f"  {nombre:7s}: {(res.labels == valor).sum():,} puntos")
 
