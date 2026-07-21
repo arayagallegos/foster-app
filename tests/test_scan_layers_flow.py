@@ -51,6 +51,32 @@ def test_recorte_caja_preserva_fino_en_mainwindow(app, qtbot, tmp_path):
     w.close()
 
 
+def test_on_load_lidar_enruta_segun_scans(app, qtbot, monkeypatch):
+    """.e57 multi-scan → capas; otros archivos → nube única. (Una sola MainWindow
+    para no acumular contextos VTK en el proceso de test.)"""
+    from app.gui import main_window as mw
+    w = mw.MainWindow()
+    qtbot.addWidget(w)
+    llamadas = {"scans": 0, "unica": 0}
+    monkeypatch.setattr(w, "_cargar_scans_por_capas",
+                        lambda p: llamadas.__setitem__("scans", llamadas["scans"] + 1))
+    monkeypatch.setattr(w, "_cargar_nube_unica",
+                        lambda p, t: llamadas.__setitem__("unica", llamadas["unica"] + 1))
+
+    # .e57 con 5 scans → capas
+    monkeypatch.setattr(w, "_open_file_dialog", lambda *a, **k: "X.e57")
+    monkeypatch.setattr(mw, "_e57_scan_count_safe", lambda p: 5)
+    w._on_load_lidar()
+    assert (llamadas["scans"], llamadas["unica"]) == (1, 0)
+
+    # .ply → nube única
+    monkeypatch.setattr(w, "_open_file_dialog", lambda *a, **k: "nube.ply")
+    monkeypatch.setattr(mw, "_e57_scan_count_safe", lambda p: 1)
+    w._on_load_lidar()
+    assert (llamadas["scans"], llamadas["unica"]) == (1, 1)
+    w.close()
+
+
 def test_scan_layers_loaded_puebla_stack(app, qtbot, tmp_path):
     from app.gui.main_window import MainWindow
     w = MainWindow()

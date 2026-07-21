@@ -38,6 +38,17 @@ from app.gui.panels.crop_dock import CropDock
 from app.gui.panels.info_panel import InfoPanel
 
 
+def _e57_scan_count_safe(path: str) -> int:
+    """Nº de scans de un .e57 (1 si no es .e57 o si falla la lectura del header)."""
+    if not path.lower().endswith(".e57"):
+        return 1
+    try:
+        from app.core.io import _e57_scan_count
+        return _e57_scan_count(path)
+    except Exception:
+        return 1
+
+
 class MainWindow(QMainWindow):
     """Ventana principal de Foster App."""
 
@@ -104,13 +115,6 @@ class MainWindow(QMainWindow):
         self._act_register.triggered.connect(self._on_register_scans)
         tb.addAction(self._act_register)
 
-        # --- Cargar scans del e57 como capas ---
-        self._act_load_scan_layers = QAction("🗂  Cargar scans (capas)", self)
-        self._act_load_scan_layers.setToolTip(
-            "Cargar el .e57 como una capa por scan (activa/desactiva scans interiores)"
-        )
-        self._act_load_scan_layers.triggered.connect(self._on_load_scan_layers)
-        tb.addAction(self._act_load_scan_layers)
 
         # --- Cargar Fotogrametría ---
         self._act_load_photo = QAction("📷  Cargar Fotogrametría", self)
@@ -336,11 +340,18 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_load_lidar(self):
-        """Abre diálogo para cargar nube LiDAR."""
+        """Carga LiDAR: un .e57 con varios scans se abre como capas por scan;
+        cualquier otro archivo (o .e57 de un scan) como nube única."""
         path = self._open_file_dialog("Cargar nube LiDAR")
         if not path:
             return
-        self._load_cloud(path, cloud_type="lidar")
+        if _e57_scan_count_safe(path) >= 2:
+            self._cargar_scans_por_capas(path)
+        else:
+            self._cargar_nube_unica(path, "lidar")
+
+    def _cargar_nube_unica(self, path: str, cloud_type: str) -> None:
+        self._load_cloud(path, cloud_type=cloud_type)
 
     def _on_load_photo(self):
         """Abre diálogo para cargar nube de fotogrametría."""
@@ -349,14 +360,8 @@ class MainWindow(QMainWindow):
             return
         self._load_cloud(path, cloud_type="photo")
 
-    def _on_load_scan_layers(self) -> None:
+    def _cargar_scans_por_capas(self, path: str) -> None:
         """Carga el .e57 como una capa por scan (con caché de dos resoluciones)."""
-        path = self._open_file_dialog("Cargar scans del .e57 como capas")
-        if not path:
-            return
-        if not path.lower().endswith(".e57"):
-            self.show_status("Selecciona un archivo .e57.")
-            return
         cache_dir = Path("output/scans_cache") / Path(path).stem
         self.show_status("Cargando scans (1ª vez puede tardar; luego usa caché)...")
         self._set_loading(True)
