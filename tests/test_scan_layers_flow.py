@@ -21,6 +21,36 @@ def _scan_info(idx, n, tmp_path):
     return ScanCacheInfo(index=idx, n_pts_fino=n, fine_path=fp, pcd_grueso=pcd)
 
 
+def test_recorte_caja_preserva_fino_en_mainwindow(app, qtbot, tmp_path):
+    from app.core.layers import CloudLayer, LayerStack
+    from app.gui.main_window import MainWindow
+
+    w = MainWindow()
+    qtbot.addWidget(w)
+    rng = np.random.default_rng(0)
+    fino = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(rng.uniform(0, 10, (4000, 3))))
+    fp = tmp_path / "scan_00.ply"
+    o3d.io.write_point_cloud(str(fp), fino)
+    grueso = fino.voxel_down_sample(0.5)
+    stack = LayerStack()
+    stack.layers = [CloudLayer(name="Scan 00", pcd=grueso, fine_path=fp)]
+    stack.active_index = 0
+    w._layer_stack = stack
+    w._active_tool = "caja"
+    w._crop_min = np.array([0., 0., 0.])
+    w._crop_max = np.array([5., 10., 10.])
+    w._EDITS_DIR = tmp_path / "_edits"
+
+    w._on_box_apply()
+    # la nueva capa activa (Recorte) conserva fine_path fino recortado
+    assert w._layer_stack.active.fine_path is not None
+    assert w._layer_stack.active.fine_path.exists()
+    recorte_fino = o3d.io.read_point_cloud(str(w._layer_stack.active.fine_path))
+    assert np.all(np.asarray(recorte_fino.points)[:, 0] <= 5.0)
+    w.close()
+
+
 def test_scan_layers_loaded_puebla_stack(app, qtbot, tmp_path):
     from app.gui.main_window import MainWindow
     w = MainWindow()

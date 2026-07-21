@@ -54,6 +54,7 @@ class MainWindow(QMainWindow):
         self._crop_min: np.ndarray | None = None
         self._crop_max: np.ndarray | None = None
         self._lasso_mask: np.ndarray | None = None
+        self._lasso_ops: list = []   # [(verts, set_op)] para reconstruir el recorte fino
         self._lasso_set_op: str = "union"
 
         self._setup_window()
@@ -578,6 +579,7 @@ class MainWindow(QMainWindow):
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         self._lasso_mask = None
+        self._lasso_ops = []
         self._crop_min = None
         self._crop_max = None
         self._active_tool = None
@@ -588,6 +590,33 @@ class MainWindow(QMainWindow):
             if act.data() != keep_checked:
                 act.setChecked(False)
 
+    _EDITS_DIR = Path("output/scans_cache/_edits")
+
+    def _fine_keep_fn(self):
+        """Criterio de recorte reaplicable a la nube fina, según la herramienta."""
+        if self._active_tool == "caja" and self._crop_min is not None:
+            mn, mx = self._crop_min, self._crop_max
+
+            def fn(pcd_fino):
+                pts = np.asarray(pcd_fino.points)
+                return np.all((pts >= mn) & (pts <= mx), axis=1)
+            return fn
+        if self._active_tool == "lazo" and self._lasso_ops:
+            from app.modules.processing import apply_lasso
+            ops = list(self._lasso_ops)      # [(verts, set_op), ...] en orden
+
+            def fn(pcd_fino):
+                screen, valid = self.viewer.project_cloud_to_screen(pcd_fino)
+                mask = np.zeros(len(screen), dtype=bool)
+                for verts, op in ops:
+                    base = mask
+                    if not mask.any() and op in ("difference", "intersection"):
+                        base = np.ones(len(screen), dtype=bool)
+                    mask = apply_lasso(screen, valid, verts, op, base)
+                return mask
+            return fn
+        return lambda pcd_fino: None    # sin criterio → split normal
+
     def _apply_split(self, keep_mask: np.ndarray) -> None:
         """Núcleo común de Aplicar (caja y lazo): divide la capa activa."""
         stack = self._layer_stack
@@ -595,7 +624,9 @@ class MainWindow(QMainWindow):
             return
         fuente_nombre = stack.active.name
         try:
-            recorte, descarte = stack.split_active(keep_mask)
+            recorte, descarte = stack.split_active_fino(
+                keep_mask, self._fine_keep_fn(), self._EDITS_DIR
+            )
         except ValueError as e:
             # Nada que separar (todo verde o todo rojo): limpiar el preview
             # para no dejar la capa pintada, y partir de cero.
@@ -609,6 +640,7 @@ class MainWindow(QMainWindow):
             return
 
         self._lasso_mask = None
+        self._lasso_ops = []
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         self.viewer.show_layers(stack)
@@ -725,6 +757,8 @@ class MainWindow(QMainWindow):
             )
         else:
             self._lasso_mask = new_mask
+            # Guardar la operación para reconstruir el recorte sobre la nube fina
+            self._lasso_ops.append((verts, self._lasso_set_op))
             self.show_status(
                 f"Lazo: {n_dentro:,} pts dentro del poligono → "
                 f"{int(new_mask.sum()):,} en verde. Puedes mover la camara para "
