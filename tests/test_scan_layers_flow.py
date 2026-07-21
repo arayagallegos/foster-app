@@ -21,6 +21,28 @@ def _scan_info(idx, n, tmp_path):
     return ScanCacheInfo(index=idx, n_pts_fino=n, fine_path=fp, pcd_grueso=pcd)
 
 
+def test_activar_recorte_funciona_con_stack_de_scans(app, qtbot, tmp_path):
+    """Regresión: con capas-scan cargadas (project.lidar_cloud vacío), activar la
+    herramienta de recorte NO debe abortar por no encontrar nube en el project."""
+    from app.core.layers import CloudLayer, LayerStack
+    from app.gui.main_window import MainWindow
+
+    w = MainWindow()
+    qtbot.addWidget(w)
+    rng = np.random.default_rng(0)
+    pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(rng.uniform(0, 5, (300, 3))))
+    stack = LayerStack()
+    stack.layers = [CloudLayer(name="Scan 00", pcd=pcd, fine_path=tmp_path / "s.ply")]
+    stack.active_index = 0
+    w._layer_stack = stack
+    assert w.project.lidar_cloud is None       # el flujo de scans no lo llena
+
+    assert w._ensure_layer_stack() is True     # antes devolvía False → recorte abortaba
+    w._activate_tool("caja")
+    assert w._active_tool == "caja"            # la herramienta quedó activa
+    w.close()
+
+
 def test_recorte_caja_preserva_fino_en_mainwindow(app, qtbot, tmp_path):
     from app.core.layers import CloudLayer, LayerStack
     from app.gui.main_window import MainWindow

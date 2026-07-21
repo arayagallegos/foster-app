@@ -535,14 +535,16 @@ class MainWindow(QMainWindow):
         return self._crop_dock
 
     def _ensure_layer_stack(self) -> bool:
-        """Crea el stack de capas desde la nube activa si aún no existe."""
+        """Asegura que exista un stack de capas. Si ya hay uno (p. ej. cargado por
+        scans), lo usa; si no, lo crea desde la nube única del project."""
+        if self._layer_stack is not None:
+            return True
         source = self.project.fused_cloud or self.project.lidar_cloud
         if source is None:
             return False
-        if self._layer_stack is None:
-            self._layer_stack = LayerStack()
-            self._layer_stack.reset(source)
-            self.viewer.show_layers(self._layer_stack)
+        self._layer_stack = LayerStack()
+        self._layer_stack.reset(source)
+        self.viewer.show_layers(self._layer_stack)
         return True
 
     def _on_tool_action(self) -> None:
