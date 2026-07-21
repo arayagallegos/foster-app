@@ -5,6 +5,7 @@ Soporta: .e57, .las, .laz, .ply, .pcd
 """
 
 from __future__ import annotations
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -126,6 +127,116 @@ def export_point_cloud(pcd: o3d.geometry.PointCloud, path: str) -> None:
     Formato detectado por extensión (.ply, .pcd).
     """
     o3d.io.write_point_cloud(path, pcd, write_ascii=False)
+
+
+# ------------------------------------------------------------------ #
+# Scans del .e57 como capas, con caché de dos resoluciones            #
+# ------------------------------------------------------------------ #
+
+@dataclass(frozen=True)
+class ScanCacheInfo:
+    index: int
+    n_pts_fino: int
+    fine_path: Path                        # scan_NN.ply a voxel fino (en disco)
+    pcd_grueso: o3d.geometry.PointCloud    # versión gruesa para el visor
+
+
+def _scans_desde_cache(cache_dir: Path, voxel_grueso: float) -> list[ScanCacheInfo]:
+    """Carga scans ya cacheados (scan_NN.ply) sin tocar el .e57."""
+    cache_dir = Path(cache_dir)
+    scans: list[ScanCacheInfo] = []
+    for ply in sorted(cache_dir.glob("scan_*.ply")):
+        idx = int(ply.stem.split("_")[1])
+        fino = o3d.io.read_point_cloud(str(ply))
+        n_fino = len(fino.points)
+        if n_fino == 0:
+            continue
+        grueso = fino.voxel_down_sample(voxel_grueso)
+        scans.append(ScanCacheInfo(index=idx, n_pts_fino=n_fino,
+                                   fine_path=ply, pcd_grueso=grueso))
+    return scans
+
+
+def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb):
+    """
+    Streaming del .e57: por cada scan → voxel fino → escribe scan_NN.ply en cache_dir,
+    y genera la versión gruesa para el visor. float32 y `del` agresivo para no acumular
+    memoria (mismo patrón que _load_e57).
+    """
+    try:
+        import pye57
+    except ImportError:
+        raise ImportError("Instala pye57 para leer archivos .e57: pip install pye57")
+
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    e57 = pye57.E57(str(path))
+    n_scans = e57.scan_count
+    scans: list[ScanCacheInfo] = []
+
+    for i in range(n_scans):
+        if progress_cb:
+            progress_cb(int(100 * i / max(n_scans, 1)), f"Leyendo scan {i+1}/{n_scans}...")
+        try:
+            data = e57.read_scan(i, colors=True, ignore_missing_fields=True)
+        except Exception:
+            continue
+        if "cartesianX" not in data:
+            continue
+
+        xyz = np.column_stack([
+            np.asarray(data["cartesianX"], dtype=np.float32),
+            np.asarray(data["cartesianY"], dtype=np.float32),
+            np.asarray(data["cartesianZ"], dtype=np.float32),
+        ])
+        del data["cartesianX"], data["cartesianY"], data["cartesianZ"]
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
+        del xyz
+        if "colorRed" in data and "colorGreen" in data and "colorBlue" in data:
+            cols = np.column_stack([
+                np.asarray(data["colorRed"], dtype=np.float32),
+                np.asarray(data["colorGreen"], dtype=np.float32),
+                np.asarray(data["colorBlue"], dtype=np.float32),
+            ]) / 255.0
+            pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
+            del cols
+        del data
+
+        fino = pcd.voxel_down_sample(voxel_fino)
+        del pcd
+        if len(fino.points) == 0:
+            continue
+        fine_path = cache_dir / f"scan_{i:02d}.ply"
+        o3d.io.write_point_cloud(str(fine_path), fino)
+        grueso = fino.voxel_down_sample(voxel_grueso)
+        scans.append(ScanCacheInfo(index=i, n_pts_fino=len(fino.points),
+                                   fine_path=fine_path, pcd_grueso=grueso))
+        del fino
+
+    if progress_cb:
+        progress_cb(100, f"{len(scans)} scans cargados.")
+    return scans
+
+
+def load_e57_scans_cached(
+    path: str,
+    cache_dir: Path,
+    voxel_fino: float = 0.03,
+    voxel_grueso: float = 0.10,
+    progress_cb=None,
+) -> list[ScanCacheInfo]:
+    """
+    Carga cada scan del .e57 como capa, con caché de dos resoluciones.
+    1ª vez: streaming del .e57 → escribe scan_NN.ply (voxel fino) en cache_dir.
+    Siguientes: si el caché existe, lee de ahí sin tocar el .e57.
+    """
+    cache_dir = Path(cache_dir)
+    if cache_dir.exists() and any(cache_dir.glob("scan_*.ply")):
+        if progress_cb:
+            progress_cb(100, "Cargando scans desde caché...")
+        return _scans_desde_cache(cache_dir, voxel_grueso)
+    return _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb)
 
 
 # ------------------------------------------------------------------ #
