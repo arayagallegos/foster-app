@@ -1,9 +1,11 @@
 """tests/test_layers.py — Modelo de capas del recorte iterativo."""
+from pathlib import Path
+
 import numpy as np
 import open3d as o3d
 import pytest
 
-from app.core.layers import LayerStack
+from app.core.layers import CloudLayer, LayerStack
 
 
 def _pcd(n=100, seed=0, con_color=True):
@@ -21,6 +23,26 @@ def _stack_con_split(n=100, n_keep=60):
     keep[:n_keep] = True
     recorte, descarte = stack.split_active(keep)
     return stack, recorte, descarte
+
+
+def test_cloudlayer_acepta_fine_path(tmp_path):
+    p = tmp_path / "scan_00.ply"
+    capa = CloudLayer(name="Scan 00", pcd=_pcd(10), fine_path=p)
+    assert capa.fine_path == p
+    # default None
+    normal = CloudLayer(name="x", pcd=_pcd(10))
+    assert normal.fine_path is None
+
+
+def test_split_active_hijas_sin_fine_path():
+    stack = LayerStack()
+    stack.reset(_pcd(100))
+    stack.layers[0] = CloudLayer(name="Scan 00", pcd=stack.layers[0].pcd,
+                                 fine_path=Path("x.ply"))
+    keep = np.zeros(100, dtype=bool)
+    keep[:60] = True
+    recorte, descarte = stack.split_active(keep)
+    assert recorte.fine_path is None and descarte.fine_path is None
 
 
 def test_reset_crea_capa_original_activa():

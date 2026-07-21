@@ -9,6 +9,7 @@ descarte oculta — nada se pierde hasta que el usuario elimina una capa.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import open3d as o3d
@@ -19,6 +20,7 @@ class CloudLayer:
     name: str
     pcd: o3d.geometry.PointCloud
     visible: bool = True
+    fine_path: Path | None = None    # versión fina en disco (capas-scan); None = normal
 
 
 def _subset(pcd: o3d.geometry.PointCloud, mask: np.ndarray) -> o3d.geometry.PointCloud:
