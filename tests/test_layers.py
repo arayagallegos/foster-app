@@ -25,6 +25,42 @@ def _stack_con_split(n=100, n_keep=60):
     return stack, recorte, descarte
 
 
+def test_split_active_fino_recorta_la_nube_fina(tmp_path):
+    # capa-scan: gruesa en memoria + fina en disco (más puntos)
+    rng = np.random.default_rng(0)
+    fino = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(rng.uniform(0, 10, (4000, 3))))
+    fp = tmp_path / "scan_00.ply"
+    o3d.io.write_point_cloud(str(fp), fino)
+    grueso = fino.voxel_down_sample(0.5)
+
+    stack = LayerStack()
+    stack.layers = [CloudLayer(name="Scan 00", pcd=grueso, fine_path=fp)]
+    stack.active_index = 0
+
+    keep_grueso = np.asarray(grueso.points)[:, 0] < 5.0
+    def fine_keep_fn(p):
+        return np.asarray(p.points)[:, 0] < 5.0   # mismo criterio (caja)
+
+    recorte, descarte = stack.split_active_fino(keep_grueso, fine_keep_fn, tmp_path)
+    assert recorte.fine_path is not None and recorte.fine_path.exists()
+    assert descarte.fine_path is not None and descarte.fine_path.exists()
+    # el fino del recorte tiene solo los x<5 de los 4000 (≈ la mitad, no del grueso)
+    recorte_fino = o3d.io.read_point_cloud(str(recorte.fine_path))
+    assert len(recorte_fino.points) > len(recorte.pcd.points)   # fino > grueso
+    assert np.all(np.asarray(recorte_fino.points)[:, 0] < 5.0)
+
+
+def test_split_active_fino_sin_fine_path_equivale_a_split(tmp_path):
+    stack = LayerStack()
+    stack.reset(_pcd(100))
+    keep = np.zeros(100, dtype=bool)
+    keep[:60] = True
+    recorte, descarte = stack.split_active_fino(keep, lambda p: None, tmp_path)
+    assert recorte.fine_path is None and descarte.fine_path is None
+    assert len(recorte.pcd.points) == 60
+
+
 def test_merge_visible_fine_usa_los_ply_de_disco(tmp_path):
     def _mk(idx, n_fino):
         rng = np.random.default_rng(idx)

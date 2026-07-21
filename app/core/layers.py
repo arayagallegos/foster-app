@@ -78,6 +78,32 @@ class LayerStack:
         self.active_index = len(self.layers) - 2  # la capa "Recorte N"
         return recorte, descarte
 
+    def split_active_fino(self, keep_mask_grueso, fine_keep_fn, edits_dir):
+        """
+        Recorte que preserva la resolución fina. Si la capa activa tiene fine_path,
+        recorta también la nube fina de disco con fine_keep_fn y asigna fine_path a
+        las hijas. Si no, equivale a split_active.
+        `fine_keep_fn(pcd_fino) -> np.ndarray[bool]` la provee el llamador (conoce
+        la cámara/caja para reaplicar el recorte a cualquier resolución).
+        """
+        fuente = self.active
+        recorte, descarte = self.split_active(keep_mask_grueso)   # divide el grueso
+        if fuente.fine_path is None or not Path(fuente.fine_path).exists():
+            return recorte, descarte
+
+        fino = o3d.io.read_point_cloud(str(fuente.fine_path))
+        keep_fino = np.asarray(fine_keep_fn(fino), dtype=bool)
+        edits_dir = Path(edits_dir)
+        edits_dir.mkdir(parents=True, exist_ok=True)
+        k = self._split_counter                                    # ya incrementado
+        rec_path = edits_dir / f"recorte_{k}_fino.ply"
+        des_path = edits_dir / f"descarte_{k}_fino.ply"
+        o3d.io.write_point_cloud(str(rec_path), _subset(fino, keep_fino))
+        o3d.io.write_point_cloud(str(des_path), _subset(fino, ~keep_fino))
+        recorte.fine_path = rec_path
+        descarte.fine_path = des_path
+        return recorte, descarte
+
     def set_visible(self, i: int, visible: bool) -> None:
         self.layers[i].visible = bool(visible)
 
