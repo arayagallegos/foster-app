@@ -306,13 +306,27 @@ def save_segments(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     rutas: dict[str, Path] = {}
+
+    # Un .ply por clase (cada uno monocromo) + acumular colores para el completo
+    colores_completo = np.empty((len(pts), 3), dtype=np.float64)
     for valor, nombre in _NOMBRES.items():
-        sel = pts[result.labels == valor]
-        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(sel))
-        pcd.paint_uniform_color(_COLORES[nombre])
+        mask = result.labels == valor
+        color = _COLORES[nombre]
+        colores_completo[mask] = color
+
+        pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts[mask]))
+        pcd.paint_uniform_color(color)
         ruta = out_dir / f"{nombre}.ply"
         o3d.io.write_point_cloud(str(ruta), pcd)
         rutas[nombre] = ruta
+
+    # Nube completa: TODOS los puntos, cada uno coloreado según su clase.
+    # Sirve para inspeccionar el modelo entero segmentado en el visor de un tirón.
+    completo = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+    completo.colors = o3d.utility.Vector3dVector(colores_completo)
+    ruta_completo = out_dir / "completo.ply"
+    o3d.io.write_point_cloud(str(ruta_completo), completo)
+    rutas["completo"] = ruta_completo
 
     (out_dir / "parametros_foster.json").write_text(
         json.dumps(asdict(result.params), indent=2)

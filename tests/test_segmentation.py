@@ -122,3 +122,27 @@ def test_save_segments_escribe_ply_y_json(tmp_path):
     data = json.loads((tmp_path / "parametros_foster.json").read_text())
     assert data["r_tambor_ext"] == pytest.approx(2.5, abs=0.02)
     assert data["r_tambor_int"] is None
+
+
+def test_save_segments_escribe_nube_completa_coloreada(tmp_path):
+    """Además de los archivos por clase, un único .ply con TODOS los puntos
+    coloreados según su clase, para inspeccionar el modelo completo en el visor."""
+    import open3d as o3d
+
+    from app.modules.segmentation import save_segments
+
+    pts, _ = make_synthetic_foster(seed=9)
+    res = segment_foster(pts)
+    rutas = save_segments(pts, res, tmp_path)
+
+    assert "completo" in rutas
+    completo = rutas["completo"]
+    assert completo.exists()
+
+    pcd = o3d.io.read_point_cloud(str(completo))
+    # No se pierde ni se duplica ningún punto
+    assert len(pcd.points) == len(pts)
+    # Está coloreado (por clase), no monocromo
+    assert pcd.has_colors()
+    colores_unicos = np.unique(np.asarray(pcd.colors), axis=0)
+    assert len(colores_unicos) >= 2   # al menos dos clases presentes
