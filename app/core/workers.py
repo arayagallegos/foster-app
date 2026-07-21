@@ -95,6 +95,36 @@ class RegistrationWorker(QThread):
             self.error.emit(str(ex))
 
 
+class ScanLayersWorker(QThread):
+    """Carga los scans del .e57 como capas (con caché) en un hilo aparte."""
+
+    finished = pyqtSignal(object)   # list[ScanCacheInfo]
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    status   = pyqtSignal(str)
+
+    def __init__(self, path: str, cache_dir, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._cache_dir = cache_dir
+
+    def run(self):
+        try:
+            from app.core.io import load_e57_scans_cached
+
+            def cb(pct, msg):
+                self.progress.emit(int(pct))
+                self.status.emit(msg)
+
+            scans = load_e57_scans_cached(self._path, self._cache_dir, progress_cb=cb)
+            if not scans:
+                self.error.emit("No se cargó ningún scan válido del archivo.")
+                return
+            self.finished.emit(scans)
+        except Exception as ex:
+            self.error.emit(str(ex))
+
+
 class BaseWorker(QThread):
     """
     Worker genérico para operaciones futuras (ICP, Poisson, etc.).
