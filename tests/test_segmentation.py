@@ -25,6 +25,20 @@ def test_perfil_radios_recupera_cilindro():
     assert np.allclose(radios, 2.0, atol=0.05)   # radio constante recuperado
 
 
+def test_segment_by_profile_clasifica_6_clases():
+    from app.modules.segmentation import segment_by_profile
+    from app.modules.segmentation_metrics import evaluate
+    from tests.synthetic_cloud import make_synthetic_foster_6clases
+    pts, truth = make_synthetic_foster_6clases(seed=2)
+    res = segment_by_profile(pts)
+    assert set(np.unique(res.labels)).issubset({0, 1, 2, 3, 4, 5})
+    m = evaluate(res.labels, truth, n_classes=6)
+    assert m.per_class[2].iou > 0.6      # tambor
+    assert m.per_class[3].iou > 0.6      # cúpula
+    assert m.per_class[4].iou > 0.4      # cornisa
+    assert m.per_class[5].iou > 0.4      # contrafuerte
+
+
 def test_generador_sintetico_produce_clases_y_rangos():
     pts, labels = make_synthetic_foster(seed=1)
     assert pts.shape[1] == 3 and len(pts) == len(labels)

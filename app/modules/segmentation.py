@@ -334,6 +334,88 @@ def segment_foster(
 
 
 # ------------------------------------------------------------------ #
+# Segmentación por perfil de radio por altura (6 clases)               #
+# ------------------------------------------------------------------ #
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    eps_plano: float = 0.05
+    max_tilt_deg: float = 15.0
+    paso: float = 0.10
+    eps_circulo: float = 0.03
+    min_inliers: int = 100       # más bajo que el default (secciones ralas como la cúpula)
+    h_muro: float = 1.5          # tambor: [z_suelo, z_suelo + h_muro]
+    h_cornisa: float = 0.9       # cornisa: [.., z_suelo + h_muro + h_cornisa]; arriba cúpula
+    margen_circulo: float = 0.08         # tolerancia radial para pertenecer al círculo
+    margen_contrafuerte: float = 0.10    # cuánto debe sobresalir para ser contrafuerte
+
+
+def _params_from_bandas(bandas, z_suelo, config=None):
+    """Arma FosterParams desde el perfil (radio de muro = mediana de bandas de tambor)."""
+    if config is None:
+        config = ProfileConfig()
+    if not bandas:
+        return FosterParams(z_suelo=z_suelo, cx=0.0, cy=0.0, r_tambor_ext=0.0,
+                            r_tambor_int=None, z_top_muro=z_suelo,
+                            centro_cupula=(0.0, 0.0, z_suelo), r_cupula=0.0)
+    z_top_muro = z_suelo + config.h_muro
+    muro = [b for b in bandas if b.z <= z_top_muro]
+    cx = float(np.median([b.cx for b in bandas]))
+    cy = float(np.median([b.cy for b in bandas]))
+    r_ext = float(np.median([b.r_ext for b in muro])) if muro else bandas[0].r_ext
+    r_int_vals = [b.r_int for b in muro if b.r_int is not None]
+    r_int = float(np.median(r_int_vals)) if r_int_vals else None
+    r_cup = max(b.r_ext for b in bandas)     # aproximación
+    return FosterParams(z_suelo=z_suelo, cx=cx, cy=cy, r_tambor_ext=r_ext,
+                        r_tambor_int=r_int, z_top_muro=z_top_muro,
+                        centro_cupula=(cx, cy, z_top_muro), r_cupula=r_cup)
+
+
+def segment_by_profile(pts, config=ProfileConfig()):
+    """
+    Segmentación por perfil de radio por altura (6 clases): suelo (plano) → perfil de
+    radios por bandas → asignación de cada punto por su banda de altura y su radio.
+    0=interior, 1=suelo, 2=tambor, 3=cupula, 4=cornisa, 5=contrafuerte.
+    """
+    labels = np.zeros(len(pts), dtype=int)      # 0 = interior/resto
+    z_suelo, mask_suelo = segment_ground(
+        pts, eps=config.eps_plano, max_tilt_deg=config.max_tilt_deg)
+    labels[mask_suelo] = 1
+    resto_idx = np.where(~mask_suelo)[0]
+    p = pts[resto_idx]
+
+    bandas = perfil_radios(p, paso=config.paso, eps=config.eps_circulo,
+                           min_inliers=config.min_inliers)
+    if not bandas:
+        return SegmentationResult(labels=labels,
+                                  params=_params_from_bandas([], z_suelo, config))
+    zb = np.array([b.z for b in bandas])
+    z_top_muro = z_suelo + config.h_muro
+    z_top_cornisa = z_top_muro + config.h_cornisa
+
+    for j, idx in enumerate(resto_idx):
+        pt = p[j]
+        b = bandas[int(np.argmin(np.abs(zb - pt[2])))]   # banda de altura más cercana
+        r = np.hypot(pt[0] - b.cx, pt[1] - b.cy)
+        if pt[2] <= z_top_muro:
+            zona = 2
+        elif pt[2] <= z_top_cornisa:
+            zona = 4
+        else:
+            zona = 3
+        d_ext = abs(r - b.r_ext)
+        d_int = abs(r - b.r_int) if b.r_int is not None else np.inf
+        if zona in (2, 4) and r > b.r_ext + config.margen_contrafuerte:
+            labels[idx] = 5
+        elif min(d_ext, d_int) < config.margen_circulo:
+            labels[idx] = zona
+        else:
+            labels[idx] = 0
+    return SegmentationResult(labels=labels,
+                              params=_params_from_bandas(bandas, z_suelo, config))
+
+
+# ------------------------------------------------------------------ #
 # Salidas                                                              #
 # ------------------------------------------------------------------ #
 
