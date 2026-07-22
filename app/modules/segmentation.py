@@ -393,19 +393,34 @@ def segment_by_profile(pts, config=ProfileConfig()):
     z_top_muro = z_suelo + config.h_muro
     z_top_cornisa = z_top_muro + config.h_cornisa
 
+    # Zona cúpula (z > z_top_cornisa): se ajusta UNA esfera directa — captura la parte
+    # esférica mucho mejor que los círculos por banda (que fallan en la cúspide rala).
+    centro_esf, r_esf = None, None
+    dome_local = np.where(p[:, 2] > z_top_cornisa)[0]
+    if len(dome_local) >= 100:
+        try:
+            c, r_esf, _ = fit_sphere_ransac(
+                p[dome_local], eps=config.margen_circulo, n_iters=2000, seed=0)
+            centro_esf = np.asarray(c)
+        except RuntimeError:
+            centro_esf = None
+
     for j, idx in enumerate(resto_idx):
         pt = p[j]
-        b = bandas[int(np.argmin(np.abs(zb - pt[2])))]   # banda de altura más cercana
+        if pt[2] > z_top_cornisa:                        # zona cúpula → esfera
+            if centro_esf is not None and \
+               abs(np.linalg.norm(pt - centro_esf) - r_esf) < config.margen_circulo:
+                labels[idx] = 3
+            else:
+                labels[idx] = 0
+            continue
+        # zonas tambor/cornisa → círculo de la banda de altura más cercana
+        b = bandas[int(np.argmin(np.abs(zb - pt[2])))]
         r = np.hypot(pt[0] - b.cx, pt[1] - b.cy)
-        if pt[2] <= z_top_muro:
-            zona = 2
-        elif pt[2] <= z_top_cornisa:
-            zona = 4
-        else:
-            zona = 3
+        zona = 2 if pt[2] <= z_top_muro else 4
         d_ext = abs(r - b.r_ext)
         d_int = abs(r - b.r_int) if b.r_int is not None else np.inf
-        if zona in (2, 4) and r > b.r_ext + config.margen_contrafuerte:
+        if r > b.r_ext + config.margen_contrafuerte:
             labels[idx] = 5
         elif min(d_ext, d_int) < config.margen_circulo:
             labels[idx] = zona
