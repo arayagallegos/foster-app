@@ -338,12 +338,15 @@ def segment_foster(
 # ------------------------------------------------------------------ #
 
 _COLORES = {           # RGB 0-1 por clase, para el visualizador y figuras
-    "resto":  (0.6, 0.6, 0.6),
-    "suelo":  (0.55, 0.4, 0.25),
-    "tambor": (0.85, 0.2, 0.2),
-    "cupula": (0.2, 0.4, 0.85),
+    "interior":     (0.6, 0.6, 0.6),
+    "suelo":        (0.55, 0.4, 0.25),
+    "tambor":       (0.85, 0.2, 0.2),
+    "cupula":       (0.2, 0.4, 0.85),
+    "cornisa":      (0.95, 0.6, 0.1),
+    "contrafuerte": (0.2, 0.7, 0.3),
 }
-_NOMBRES = {0: "resto", 1: "suelo", 2: "tambor", 3: "cupula"}
+_NOMBRES = {0: "interior", 1: "suelo", 2: "tambor", 3: "cupula",
+            4: "cornisa", 5: "contrafuerte"}
 
 
 def save_segments(

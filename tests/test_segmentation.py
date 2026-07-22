@@ -131,11 +131,25 @@ def test_save_segments_escribe_ply_y_json(tmp_path):
     pts, _ = make_synthetic_foster(seed=8)
     res = segment_foster(pts)
     rutas = save_segments(pts, res, tmp_path)
-    for clase in ("resto", "suelo", "tambor", "cupula"):
+    for clase in ("interior", "suelo", "tambor", "cupula"):
         assert rutas[clase].exists()
     data = json.loads((tmp_path / "parametros_foster.json").read_text())
     assert data["r_tambor_ext"] == pytest.approx(2.5, abs=0.02)
     assert data["r_tambor_int"] is None
+
+
+def test_save_segments_soporta_6_clases(tmp_path):
+    import open3d as o3d
+    from app.modules.segmentation import (
+        FosterParams, SegmentationResult, save_segments)
+    pts = np.random.default_rng(0).uniform(0, 5, (600, 3))
+    labels = np.arange(600) % 6            # las 6 clases presentes
+    params = FosterParams(z_suelo=0.0, cx=0.0, cy=0.0, r_tambor_ext=2.5,
+                          r_tambor_int=None, z_top_muro=3.0,
+                          centro_cupula=(0.0, 0.0, 3.0), r_cupula=2.5)
+    rutas = save_segments(pts, SegmentationResult(labels=labels, params=params), tmp_path)
+    for nombre in ("interior", "suelo", "tambor", "cupula", "cornisa", "contrafuerte"):
+        assert nombre in rutas
 
 
 def test_save_segments_escribe_nube_completa_coloreada(tmp_path):
