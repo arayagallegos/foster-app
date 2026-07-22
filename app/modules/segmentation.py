@@ -407,12 +407,15 @@ def segment_by_profile(pts, config=ProfileConfig()):
 
     for j, idx in enumerate(resto_idx):
         pt = p[j]
-        if pt[2] > z_top_cornisa:                        # zona cúpula → esfera
-            if centro_esf is not None and \
-               abs(np.linalg.norm(pt - centro_esf) - r_esf) < config.margen_circulo:
-                labels[idx] = 3
-            else:
-                labels[idx] = 0
+        en_esfera = (centro_esf is not None and
+                     abs(np.linalg.norm(pt - centro_esf) - r_esf) < config.margen_circulo)
+        # La cúpula (esfera) reclama sus puntos ANTES que la cornisa: cualquier punto
+        # sobre el muro que calce con la esfera es cúpula (recupera el faldón bajo z_cornisa).
+        if pt[2] > z_top_muro and en_esfera:
+            labels[idx] = 3
+            continue
+        if pt[2] > z_top_cornisa:            # zona cúpula pero fuera de la esfera
+            labels[idx] = 0                  # (ranura/compuertas, ápice) → interior
             continue
         # zonas tambor/cornisa → círculo de la banda de altura más cercana
         b = bandas[int(np.argmin(np.abs(zb - pt[2])))]
@@ -420,8 +423,8 @@ def segment_by_profile(pts, config=ProfileConfig()):
         zona = 2 if pt[2] <= z_top_muro else 4
         d_ext = abs(r - b.r_ext)
         d_int = abs(r - b.r_int) if b.r_int is not None else np.inf
-        if r > b.r_ext + config.margen_contrafuerte:
-            labels[idx] = 5
+        if zona == 2 and r > b.r_ext + config.margen_contrafuerte:
+            labels[idx] = 5                  # contrafuerte SOLO a la altura del tambor
         elif min(d_ext, d_int) < config.margen_circulo:
             labels[idx] = zona
         else:
