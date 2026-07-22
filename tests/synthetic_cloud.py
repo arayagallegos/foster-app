@@ -137,3 +137,64 @@ def make_synthetic_foster_dificil(seed: int = 0) -> tuple[np.ndarray, np.ndarray
         n_interior=1500,
         outlier_frac=0.15,
     )
+
+
+# ------------------------------------------------------------------ #
+# Nube fiel a escala real, con 6 clases (para segment_by_profile)      #
+# ------------------------------------------------------------------ #
+# Dimensiones medidas del Foster (ver docs/bitacora_segmentacion.md):
+R_T = 4.41          # radio exterior del tambor
+ESP_MURO = 0.21     # espesor de muro medido
+R_COR = 4.70        # radio de la cornisa (sobresale)
+H_MUR = 1.5         # altura del muro
+H_COR = 0.9         # altura de la cornisa
+ESP_CUP = 0.05      # espesor de la cáscara de la cúpula
+
+
+def make_synthetic_foster_6clases(
+    seed: int = 0, noise: float = 0.01, outlier_frac: float = 0.1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Nube a escala real con verdad de 6 clases y sin coincidencias de clase:
+    0=interior, 1=suelo, 2=tambor, 3=cupula, 4=cornisa, 5=contrafuerte.
+    """
+    rng = np.random.default_rng(seed)
+    partes = [
+        (_disk(9.0, 0.0, 9000, rng), 1),                        # suelo
+        (_ring(R_T, 0.0, H_MUR, 7000, rng), 2),                 # tambor ext
+        (_ring(R_T - ESP_MURO, 0.0, H_MUR, 4000, rng), 2),      # tambor int
+        (_ring(R_COR, H_MUR, H_MUR + H_COR, 3000, rng), 4),     # cornisa (radio máx)
+        (_dome(R_T, H_MUR + H_COR, 6000, rng), 3),              # cúpula ext
+        (_dome(R_T - ESP_CUP, H_MUR + H_COR, 4000, rng), 3),    # cúpula int
+    ]
+    # contrafuertes: prismas radiales que SOBRESALEN del tambor
+    for k in range(6):
+        ang = 2 * np.pi * k / 6
+        du = np.array([np.cos(ang), np.sin(ang), 0.0])
+        dv = np.array([-np.sin(ang), np.cos(ang), 0.0])
+        base = R_T * du
+        u = rng.uniform(0.03, 0.5, 700)           # arranca 3 cm fuera del muro (sin coincidir)
+        v = rng.uniform(-0.2, 0.2, 700)
+        zz = rng.uniform(0.0, H_MUR - 0.10, 700)  # termina bajo la cornisa (sin coincidir)
+        cf = base + np.outer(u, du) + np.outer(v, dv)
+        cf[:, 2] = zz
+        partes.append((cf, 5))
+    # interior: puntos sueltos dentro del tambor
+    interior = np.column_stack([
+        rng.uniform(-R_T * 0.6, R_T * 0.6, 1500),
+        rng.uniform(-R_T * 0.6, R_T * 0.6, 1500),
+        rng.uniform(0.3, H_MUR + H_COR, 1500),
+    ])
+    partes.append((interior, 0))
+
+    pts = np.vstack([p for p, _ in partes])
+    labels = np.concatenate([np.full(len(p), lab) for p, lab in partes])
+    pts = pts + rng.normal(0.0, noise, pts.shape)
+    if outlier_frac > 0:
+        n = int(outlier_frac * len(pts))
+        out = np.column_stack([rng.uniform(-9, 9, n), rng.uniform(-9, 9, n),
+                               rng.uniform(0, 8, n)])
+        pts = np.vstack([pts, out])
+        labels = np.concatenate([labels, np.zeros(n, dtype=int)])
+    orden = rng.permutation(len(pts))
+    return pts[orden], labels[orden]

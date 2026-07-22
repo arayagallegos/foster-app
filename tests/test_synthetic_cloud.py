@@ -6,6 +6,34 @@ from tests.synthetic_cloud import (
 )
 
 
+def test_sintetica_6clases_tiene_todas_las_clases_y_dimensiones():
+    from tests.synthetic_cloud import make_synthetic_foster_6clases
+    pts, lab = make_synthetic_foster_6clases(seed=0)
+    assert set(np.unique(lab)) == {0, 1, 2, 3, 4, 5}
+    # radio del tambor (clase 2) ≈ 4.41
+    tam = pts[lab == 2]
+    r = np.hypot(tam[:, 0], tam[:, 1])
+    assert 4.3 < np.median(r) < 4.5
+    # cornisa (clase 4) sobresale (radio máx)
+    cor = pts[lab == 4]
+    assert np.hypot(cor[:, 0], cor[:, 1]).max() > 4.6
+    # contrafuertes (clase 5) fuera del tambor
+    con = pts[lab == 5]
+    assert np.hypot(con[:, 0], con[:, 1]).max() > 4.41
+
+
+def test_sintetica_6clases_verdad_bien_planteada():
+    from scipy.spatial import cKDTree
+
+    from tests.synthetic_cloud import make_synthetic_foster_6clases
+    pts, lab = make_synthetic_foster_6clases(seed=1)
+    # ningún par de clases distintas en (casi) la misma posición
+    tree = cKDTree(pts)
+    pares = tree.query_pairs(r=0.01, output_type="ndarray")
+    if len(pares):
+        assert np.all(lab[pares[:, 0]] == lab[pares[:, 1]])
+
+
 def test_defaults_igual_que_nube_simple():
     # sin activar nada, la composición base sigue siendo suelo/tambor/cupula(+outliers)
     pts, labels = make_synthetic_foster(seed=0)
