@@ -11,6 +11,20 @@ from app.modules.segmentation import (
 from tests.synthetic_cloud import H_MURO, R_TAMBOR, _dome, make_synthetic_foster
 
 
+def test_perfil_radios_recupera_cilindro():
+    from app.modules.segmentation import perfil_radios
+    rng = np.random.default_rng(0)
+    # cilindro r=2.0, z en [0,3]
+    th = rng.uniform(0, 2 * np.pi, 20000)
+    z = rng.uniform(0, 3, 20000)
+    pts = np.column_stack([2.0 * np.cos(th), 2.0 * np.sin(th), z])
+    pts += rng.normal(0, 0.01, pts.shape)
+    bandas = perfil_radios(pts, paso=0.2)
+    assert len(bandas) >= 10
+    radios = [b.r_ext for b in bandas]
+    assert np.allclose(radios, 2.0, atol=0.05)   # radio constante recuperado
+
+
 def test_generador_sintetico_produce_clases_y_rangos():
     pts, labels = make_synthetic_foster(seed=1)
     assert pts.shape[1] == 3 and len(pts) == len(labels)

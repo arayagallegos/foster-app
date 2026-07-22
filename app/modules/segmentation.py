@@ -74,6 +74,55 @@ def fit_circle_ransac(
 
 
 # ------------------------------------------------------------------ #
+# Perfil de radio por altura (secciones horizontales à la Funari)      #
+# ------------------------------------------------------------------ #
+
+@dataclass(frozen=True)
+class BandaRadio:
+    z: float                 # altura media de la banda
+    cx: float
+    cy: float
+    r_ext: float
+    r_int: float | None      # cara interior si se detectó (concéntrica, espesor plausible)
+
+
+def perfil_radios(pts, paso=0.10, eps=0.03, min_inliers=200, n_iters=500, seed=0):
+    """
+    Corta `pts` (ya sin suelo) en bandas horizontales de altura `paso` y ajusta un
+    círculo exterior por banda (+ interior si hay una segunda cara concéntrica).
+    Devuelve la lista de BandaRadio, base del perfil de radio por altura.
+    """
+    bandas: list[BandaRadio] = []
+    z_min, z_max = pts[:, 2].min(), pts[:, 2].max()
+    z = z_min
+    while z < z_max:
+        banda = pts[(pts[:, 2] >= z) & (pts[:, 2] < z + paso)]
+        if len(banda) >= 100:
+            try:
+                cx, cy, r1, m1 = fit_circle_ransac(banda[:, :2], eps=eps,
+                                                   n_iters=n_iters, seed=seed)
+            except RuntimeError:
+                z += paso
+                continue
+            if m1.sum() >= min_inliers and r1 < 8.0:
+                r_int = None
+                resto = banda[~m1]
+                if len(resto) >= 100:
+                    try:
+                        cx2, cy2, r2, m2 = fit_circle_ransac(
+                            resto[:, :2], eps=eps, n_iters=n_iters, seed=seed)
+                        conc = np.hypot(cx2 - cx, cy2 - cy) < 0.3
+                        r_out, r_in = max(r1, r2), min(r1, r2)
+                        if conc and m2.sum() >= 150 and 0.02 < r_out - r_in < 1.0:
+                            r1, r_int = r_out, r_in
+                    except RuntimeError:
+                        pass
+                bandas.append(BandaRadio(z + paso / 2, cx, cy, r1, r_int))
+        z += paso
+    return bandas
+
+
+# ------------------------------------------------------------------ #
 # Esfera (cúpula)                                                      #
 # ------------------------------------------------------------------ #
 
