@@ -198,3 +198,61 @@ def make_synthetic_foster_6clases(
         labels = np.concatenate([labels, np.zeros(n, dtype=int)])
     orden = rng.permutation(len(pts))
     return pts[orden], labels[orden]
+
+
+# ------------------------------------------------------------------ #
+# Interior sintético con verdad conocida (para refine_interior/DBSCAN) #
+# ------------------------------------------------------------------ #
+def make_synthetic_interior(
+    seed: int = 0, noise: float = 0.005,
+) -> tuple[np.ndarray, np.ndarray, tuple[float, float, float], float]:
+    """Interior sintético a escala real, con verdad conocida.
+    Devuelve (pts, truth, centro_cupula, r_cupula).
+      7 = compuertas (parche denso sobre la esfera -> superficie plana),
+      3 = vigas       (costillas finas que huggean la esfera -> lineales, adosadas),
+      6 = descartado  (telescopio central + bloques de equipo, despegados del domo).
+    """
+    rng = np.random.default_rng(seed)
+    centro = np.array([0.0, 0.0, 0.0])
+    r = 6.0
+    partes: list[tuple[np.ndarray, int]] = []
+
+    # Compuertas: parche denso sobre la esfera (ventana angular acotada) -> planar
+    n = 6000
+    th = rng.uniform(0.2, 1.1, n)
+    ph = rng.uniform(0.2, 0.9, n)
+    sinp = np.sin(ph)
+    panel = np.column_stack([r * sinp * np.cos(th), r * sinp * np.sin(th), r * np.cos(ph)])
+    partes.append((panel, 7))
+
+    # Vigas/costillas: arcos finos sobre la esfera, lejos del cenit para no tocar el panel
+    for a in (3.5, 4.3):
+        m = 1500
+        ph2 = rng.uniform(0.5, 1.3, m)
+        rib = np.column_stack([
+            r * np.sin(ph2) * np.cos(a), r * np.sin(ph2) * np.sin(a), r * np.cos(ph2)])
+        rib += rng.normal(0.0, 0.01, rib.shape)   # barra fina => cluster lineal
+        partes.append((rib, 3))
+
+    # Telescopio: cilindro vertical central (no toca la cáscara)
+    m = 4000
+    tz = rng.uniform(-3.0, 1.0, m)
+    ta = rng.uniform(0.0, 2 * np.pi, m)
+    tr = 0.5 * np.sqrt(rng.uniform(0.0, 1.0, m))
+    tele = np.column_stack([tr * np.cos(ta), tr * np.sin(ta), tz])
+    partes.append((tele, 6))
+
+    # Equipo: dos bloques cerca del piso (no tocan la cáscara)
+    for cx, cy in ((2.0, 0.0), (-1.5, 1.5)):
+        m = 1200
+        blk = np.column_stack([
+            rng.uniform(cx - 0.4, cx + 0.4, m),
+            rng.uniform(cy - 0.4, cy + 0.4, m),
+            rng.uniform(-3.2, -2.6, m)])
+        partes.append((blk, 6))
+
+    pts = np.vstack([p for p, _ in partes])
+    truth = np.concatenate([np.full(len(p), t) for p, t in partes])
+    pts = pts + rng.normal(0.0, noise, pts.shape)
+    orden = rng.permutation(len(pts))
+    return pts[orden], truth[orden], tuple(centro), r

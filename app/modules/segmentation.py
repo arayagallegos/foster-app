@@ -179,28 +179,51 @@ def fit_sphere_ransac(
 # Suelo (plano con filtro de verticalidad)                             #
 # ------------------------------------------------------------------ #
 
+def _fit_plane_ransac(
+    pts: np.ndarray, eps: float, n_iters: int = 1000, seed: int = 0
+) -> tuple[np.ndarray, float, np.ndarray]:
+    """RANSAC de plano propio (con semilla → reproducible). 3 puntos definen el
+    candidato; gana el de mayor soporte. Devuelve (normal, d, idx_inliers) con la
+    normal unitaria y el plano normal·x + d = 0."""
+    rng = np.random.default_rng(seed)
+    n = len(pts)
+    best_count, best = 0, None
+    for _ in range(n_iters):
+        tri = pts[rng.choice(n, 3, replace=False)]
+        normal = np.cross(tri[1] - tri[0], tri[2] - tri[0])
+        norm = np.linalg.norm(normal)
+        if norm < 1e-9:
+            continue
+        normal = normal / norm
+        d = -float(normal @ tri[0])
+        count = int((np.abs(pts @ normal + d) < eps).sum())
+        if count > best_count:
+            best_count, best = count, (normal, d)
+    if best is None:
+        raise RuntimeError("RANSAC no encontró un plano con soporte suficiente.")
+    normal, d = best
+    idx = np.where(np.abs(pts @ normal + d) < eps)[0]
+    return normal, d, idx
+
+
 def segment_ground(
     pts: np.ndarray,
     eps: float = 0.05,
     max_tilt_deg: float = 15.0,
     max_attempts: int = 5,
+    seed: int = 0,
 ) -> tuple[float, np.ndarray]:
     """
-    Plano de suelo con segment_plane de Open3D, aceptando solo planos cuya
-    normal forme < max_tilt_deg con la vertical (los dominantes no horizontales,
-    p. ej. paredes, se descartan y se reintenta sobre el resto).
+    Plano de suelo con un RANSAC propio (con semilla `seed` → reproducible),
+    aceptando solo planos cuya normal forme < max_tilt_deg con la vertical (los
+    dominantes no horizontales, p. ej. paredes, se descartan y se reintenta sobre
+    el resto). Se usa RANSAC propio y no segment_plane de Open3D porque esa API no
+    expone semilla en esta versión y hacía la segmentación no determinista.
     """
-    import open3d as o3d
-
     cos_max = np.cos(np.radians(max_tilt_deg))
     restantes = np.arange(len(pts))
     for _ in range(max_attempts):
-        sub = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts[restantes]))
-        (a, b, c, _d), idx = sub.segment_plane(
-            distance_threshold=eps, ransac_n=3, num_iterations=1000
-        )
-        normal = np.array([a, b, c])
-        normal /= np.linalg.norm(normal)
+        normal, _d, idx = _fit_plane_ransac(pts[restantes], eps, seed=seed)
         if abs(normal[2]) >= cos_max:
             mask = np.zeros(len(pts), dtype=bool)
             mask[restantes[idx]] = True
@@ -444,9 +467,11 @@ _COLORES = {           # RGB 0-1 por clase, para el visualizador y figuras
     "cupula":       (0.2, 0.4, 0.85),
     "cornisa":      (0.95, 0.6, 0.1),
     "contrafuerte": (0.2, 0.7, 0.3),
+    "descartado":   (0.25, 0.25, 0.25),
+    "compuertas":   (0.95, 0.85, 0.1),
 }
 _NOMBRES = {0: "interior", 1: "suelo", 2: "tambor", 3: "cupula",
-            4: "cornisa", 5: "contrafuerte"}
+            4: "cornisa", 5: "contrafuerte", 6: "descartado", 7: "compuertas"}
 
 
 def save_segments(

@@ -39,6 +39,17 @@ def test_segment_by_profile_clasifica_6_clases():
     assert m.per_class[5].iou > 0.4      # contrafuerte
 
 
+def test_segment_by_profile_es_determinista():
+    """Regresión: sin semilla en el RANSAC del suelo, la segmentación variaba entre
+    corridas (rompía el flujo de elegir ids de cluster y reejecutar)."""
+    from app.modules.segmentation import segment_by_profile
+    from tests.synthetic_cloud import make_synthetic_foster_6clases
+    pts, _ = make_synthetic_foster_6clases(seed=3)
+    a = segment_by_profile(pts).labels
+    b = segment_by_profile(pts).labels
+    assert np.array_equal(a, b)
+
+
 def test_generador_sintetico_produce_clases_y_rangos():
     pts, labels = make_synthetic_foster(seed=1)
     assert pts.shape[1] == 3 and len(pts) == len(labels)
@@ -164,6 +175,20 @@ def test_save_segments_soporta_6_clases(tmp_path):
     rutas = save_segments(pts, SegmentationResult(labels=labels, params=params), tmp_path)
     for nombre in ("interior", "suelo", "tambor", "cupula", "cornisa", "contrafuerte"):
         assert nombre in rutas
+
+
+def test_save_segments_soporta_8_clases(tmp_path):
+    from app.modules.segmentation import (
+        FosterParams, SegmentationResult, save_segments)
+    pts = np.random.default_rng(0).uniform(0, 5, (800, 3))
+    labels = np.arange(800) % 8            # las 8 clases presentes
+    params = FosterParams(z_suelo=0.0, cx=0.0, cy=0.0, r_tambor_ext=2.5,
+                          r_tambor_int=None, z_top_muro=3.0,
+                          centro_cupula=(0.0, 0.0, 3.0), r_cupula=2.5)
+    rutas = save_segments(pts, SegmentationResult(labels=labels, params=params), tmp_path)
+    for nombre in ("interior", "suelo", "tambor", "cupula", "cornisa",
+                   "contrafuerte", "descartado", "compuertas"):
+        assert nombre in rutas and rutas[nombre].exists()
 
 
 def test_save_segments_escribe_nube_completa_coloreada(tmp_path):

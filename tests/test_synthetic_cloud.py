@@ -76,3 +76,16 @@ def test_dificil_activa_todo_y_es_reproducible():
     b_pts, b_lab = make_synthetic_foster_dificil(seed=7)
     assert np.array_equal(a_pts, b_pts) and np.array_equal(a_lab, b_lab)
     assert len(a_pts) > 20_000
+
+
+def test_sintetico_interior_tiene_partes_y_geometria():
+    from tests.synthetic_cloud import make_synthetic_interior
+    pts, truth, centro, r = make_synthetic_interior(seed=0)
+    centro = np.asarray(centro)
+    assert set(np.unique(truth)) == {3, 6, 7}
+    d = np.linalg.norm(pts - centro, axis=1)
+    # compuertas(7) y vigas(3) están sobre la cáscara (|d - r| pequeño)
+    for clase in (7, 3):
+        assert np.median(np.abs(d[truth == clase] - r)) < 0.15
+    # descartado(6) está lejos de la cáscara
+    assert np.median(np.abs(d[truth == 6] - r)) > 1.0
