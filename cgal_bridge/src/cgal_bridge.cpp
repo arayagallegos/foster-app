@@ -224,14 +224,43 @@ static py::array_t<double> remove_outliers(py::array_t<double> P, int k,
 }
 
 
+// Prioridad con LIMITE DE PERIMETRO: rechaza (prioridad infinita) los triangulos
+// cuyo perimetro supere `bound`. Es el mecanismo que ofrece CGAL para evitar que
+// el frente "puentee" vacios con triangulos estirados — que es justo lo que
+// genera superficie inventada entre islas de puntos.
+struct PerimetroAcotado {
+    double bound;
+    explicit PerimetroAcotado(double b) : bound(b) {}
+
+    template <typename AdvancingFront, typename Cell_handle>
+    double operator()(const AdvancingFront& adv, Cell_handle& c,
+                      const int& index) const {
+        if (bound == 0)
+            return adv.smallest_radius_delaunay_sphere(c, index);
+        const Point& a = c->vertex((index + 1) % 4)->point();
+        const Point& b = c->vertex((index + 2) % 4)->point();
+        const Point& d = c->vertex((index + 3) % 4)->point();
+        double per = std::sqrt(CGAL::squared_distance(a, b))
+                   + std::sqrt(CGAL::squared_distance(b, d))
+                   + std::sqrt(CGAL::squared_distance(a, d));
+        if (per > bound) return adv.infinity();          // triangulo demasiado grande
+        return adv.smallest_radius_delaunay_sphere(c, index);
+    }
+};
+
+
 // Advancing Front: reconstruye interpolando los puntos REALES (como Ball
 // Pivoting) pero produciendo una malla MANIFOLD y orientada por construccion,
 // admitiendo bordes (superficies abiertas). No necesita normales.
-//   radius_ratio_bound: controla cuanto se permite estirar un triangulo
-//   beta: angulo maximo (rad) admitido al avanzar el frente
+//   radius_ratio_bound: deteccion de bordes/hoyos (distingue zona submuestreada
+//                       de borde real)
+//   beta: umbral de angulo diedro para la "zona de plausibilidad"
+//   max_perimetro: si >0, descarta triangulos de perimetro mayor (evita puentear
+//                  vacios). 0 = sin limite.
 static py::tuple advancing_front(py::array_t<double> P,
                                  double radius_ratio_bound = 5.0,
-                                 double beta = 0.52) {
+                                 double beta = 0.52,
+                                 double max_perimetro = 0.0) {
     auto p = P.unchecked<2>();
     std::vector<Point> pts;
     pts.reserve(p.shape(0));
@@ -240,8 +269,9 @@ static py::tuple advancing_front(py::array_t<double> P,
 
     typedef std::array<std::size_t, 3> Facet;
     std::vector<Facet> facets;
+    PerimetroAcotado prio(max_perimetro);
     CGAL::advancing_front_surface_reconstruction(
-        pts.begin(), pts.end(), std::back_inserter(facets),
+        pts.begin(), pts.end(), std::back_inserter(facets), prio,
         radius_ratio_bound, beta);
 
     py::array_t<double> V({(py::ssize_t)pts.size(), (py::ssize_t)3});
@@ -323,9 +353,10 @@ PYBIND11_MODULE(cgal_bridge, mod) {
 
     mod.def("advancing_front", &advancing_front,
             py::arg("points"), py::arg("radius_ratio_bound") = 5.0,
-            py::arg("beta") = 0.52,
+            py::arg("beta") = 0.52, py::arg("max_perimetro") = 0.0,
             "Reconstruccion Advancing Front: interpola los puntos reales y produce "
-            "malla MANIFOLD orientada con bordes. Devuelve (V, F).");
+            "malla MANIFOLD orientada con bordes. max_perimetro>0 descarta "
+            "triangulos grandes (evita puentear vacios). Devuelve (V, F).");
 
     mod.def("stitch", &stitch,
             py::arg("vertices"), py::arg("faces"),
