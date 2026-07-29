@@ -153,12 +153,17 @@ static std::pair<double, int> medir_hoyo(const Mesh& m, halfedge_descriptor h) {
 // corresponden a zonas sin datos y taparlos seria fabricar geometria.
 static py::tuple fill_holes(py::array_t<double> V, py::array_t<int> F,
                             bool fair = true, double density = 2.0,
-                            double max_perimetro = 0.0) {
+                            double max_perimetro = 0.0,
+                            bool delaunay = true, int continuidad = 1) {
     Mesh m = to_mesh(V, F);
 
     std::vector<halfedge_descriptor> borders;
     CGAL::extract_boundary_cycles(m, std::back_inserter(borders));
 
+    // use_delaunay_triangulation: la doc de CGAL lo recomienda fuertemente —
+    // restringe la busqueda de la triangulacion optima a las caras de una
+    // triangulacion de Delaunay 3D del borde, lo que acelera MUCHISIMO el
+    // rellenado (sin el, un hoyo complejo puede tardar minutos).
     // No se recogen los iteradores de salida (no se usan): asi el codigo sirve
     // igual en CGAL 5.x y 6.x, que cambiaron esa parte de la API.
     for (halfedge_descriptor h : borders) {
@@ -167,13 +172,16 @@ static py::tuple fill_holes(py::array_t<double> V, py::array_t<int> F,
 #ifdef CGAL_EIGEN3_ENABLED
         if (fair) {
             PMP::triangulate_refine_and_fair_hole(
-                m, h, CGAL::parameters::density_control_factor(density));
+                m, h, CGAL::parameters::density_control_factor(density)
+                          .use_delaunay_triangulation(delaunay)
+                          .fairing_continuity(continuidad));
             continue;
         }
 #endif
-        (void)fair;
+        (void)fair; (void)continuidad;
         PMP::triangulate_and_refine_hole(
-            m, h, CGAL::parameters::density_control_factor(density));
+            m, h, CGAL::parameters::density_control_factor(density)
+                      .use_delaunay_triangulation(delaunay));
     }
     return from_mesh(m);
 }
@@ -339,9 +347,12 @@ PYBIND11_MODULE(cgal_bridge, mod) {
     mod.def("fill_holes", &fill_holes,
             py::arg("vertices"), py::arg("faces"),
             py::arg("fair") = true, py::arg("density") = 2.0,
-            py::arg("max_perimetro") = 0.0,
+            py::arg("max_perimetro") = 0.0, py::arg("delaunay") = true,
+            py::arg("continuidad") = 1,
             "Rellena hoyos. max_perimetro>0 -> solo los de perimetro menor a ese "
-            "valor (m); los mayores se dejan abiertos. Devuelve (V, F).");
+            "valor (m); los mayores se dejan abiertos. delaunay=True acelera "
+            "mucho (recomendado por CGAL). continuidad: 0/1/2 = suavidad del "
+            "parche al hacer fairing. Devuelve (V, F).");
 
     mod.def("grid_simplify", &grid_simplify,
             py::arg("points"), py::arg("cell_size"),
