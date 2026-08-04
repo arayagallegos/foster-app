@@ -41,6 +41,7 @@ class Viewer3D(QWidget):
         self._setup_ui()
         self._active_actors: list[str] = []  # nombres de actors en la escena
         self._crop_widget = None
+        self._sphere_widget = None
         # Centro compartido de la escena: todos los actores (capas, previews)
         # se dibujan restando este centro para quedar alineados.
         self._scene_center: np.ndarray | None = None
@@ -271,6 +272,59 @@ class Viewer3D(QWidget):
         actor = self.plotter.actors.get("_crop_box_fill")
         if actor is not None:
             self.plotter.remove_actor("_crop_box_fill")
+        self.plotter.render()
+
+    # ------------------------------------------------------------------ #
+    # Herramienta de primitivas                                           #
+    # ------------------------------------------------------------------ #
+
+    def start_sphere_widget(self, pcd: o3d.geometry.PointCloud, callback) -> None:
+        """
+        Activa una esfera interactiva para segmentar por primitiva.
+
+        El callback se llama al SOLTAR (no en vivo): con nubes grandes el ajuste
+        continuo hace que arrastrar se sienta pesado.
+
+        Args:
+            pcd:      Nube sobre la que se segmenta.
+            callback: Funcion (centro: np.ndarray, radio: float) -> None,
+                      con el centro en coordenadas mundo.
+        """
+        if self._sphere_widget is not None:
+            self.stop_sphere_widget()
+
+        pts = np.asarray(pcd.points)
+        center = self._scene_center if self._scene_center is not None else pts.mean(axis=0)
+        pts_c = pts - center
+        # Esfera inicial: centrada en la nube, con radio ~40% de su extension,
+        # para que arranque cerca de una superficie util en vez de en un punto.
+        radio0 = float(np.ptp(pts_c, axis=0).max()) * 0.40
+
+        def _pv_callback(centro_widget, widget):
+            # PyVista solo pasa el CENTRO al callback; el radio hay que sacarlo
+            # del widget (por eso pass_widget=True).
+            radio = float(widget.GetRadius())
+            callback(np.asarray(centro_widget) + center, radio)
+
+        self._sphere_widget = self.plotter.add_sphere_widget(
+            _pv_callback,
+            center=pts_c.mean(axis=0),
+            radius=radio0,
+            color="#4fc3f7",
+            style="wireframe",
+            pass_widget=True,
+            test_callback=False,
+            interaction_event="end",
+        )
+
+    def stop_sphere_widget(self) -> None:
+        """Elimina la esfera interactiva del viewer."""
+        if self._sphere_widget is not None:
+            try:
+                self._sphere_widget.Off()
+            except Exception:
+                pass
+            self._sphere_widget = None
         self.plotter.render()
 
     # ------------------------------------------------------------------ #

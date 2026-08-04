@@ -11,8 +11,8 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QDockWidget, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 # (etiqueta, valor de la senal, explicacion para tooltip y dialogo de ayuda)
@@ -55,6 +55,10 @@ class CropDock(QDockWidget):
     tool_apply = pyqtSignal()
     tool_cancel = pyqtSignal()
     # Herramienta lazo
+    # (tolerancia, phi_min, phi_max)
+    esfera_params_changed = pyqtSignal(float, float, float)
+    esfera_capturar = pyqtSignal()
+
     lasso_started = pyqtSignal(str)   # set_op
     lasso_apply = pyqtSignal()
     lasso_cancel = pyqtSignal()
@@ -72,7 +76,7 @@ class CropDock(QDockWidget):
         self._build_ui()
 
     # ------------------------------------------------------------------ #
-    # UI                                                                    #
+    # UI                                                                 #
     # ------------------------------------------------------------------ #
 
     def _build_ui(self) -> None:
@@ -98,6 +102,7 @@ class CropDock(QDockWidget):
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_page_caja())   # index 0
         self._stack.addWidget(self._build_page_lazo())   # index 1
+        self._stack.addWidget(self._build_page_esfera())  # index 2
         tool_layout.addWidget(self._stack)
         layout.addWidget(self._tool_box)
 
@@ -159,6 +164,69 @@ class CropDock(QDockWidget):
         lay.addWidget(fila)
         return page
 
+    def _build_page_esfera(self) -> QWidget:
+        """Controles de la primitiva esfera: tolerancia y recorte angular.
+
+        Los dos son necesarios y hacen cosas distintas: la TOLERANCIA define
+        cuán cerca de la cáscara debe estar un punto; el RECORTE ANGULAR, en qué
+        tramo de la esfera se busca. Sin el recorte no existe una tolerancia que
+        capture zonas que se desvían (el faldón de la cúpula) sin absorber
+        elementos vecinos que están sobre la misma esfera (las compuertas).
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        lay.addWidget(QLabel("Arrastra la esfera sobre la nube.\n"
+                             "Al soltar se ajusta y muestra lo capturado."))
+
+        self._lbl_tol = QLabel()
+        self._sld_tol = QSlider(Qt.Orientation.Horizontal)
+        self._sld_tol.setRange(2, 40)            # 0.02 .. 0.40 m
+        self._sld_tol.setValue(8)
+        self._sld_tol.valueChanged.connect(self._emit_esfera_params)
+        lay.addWidget(self._lbl_tol)
+        lay.addWidget(self._sld_tol)
+
+        self._lbl_phi = QLabel()
+        self._sld_phi_min = QSlider(Qt.Orientation.Horizontal)
+        self._sld_phi_min.setRange(0, 180)
+        self._sld_phi_min.setValue(0)
+        self._sld_phi_max = QSlider(Qt.Orientation.Horizontal)
+        self._sld_phi_max.setRange(0, 180)
+        self._sld_phi_max.setValue(180)
+        for s in (self._sld_phi_min, self._sld_phi_max):
+            s.valueChanged.connect(self._emit_esfera_params)
+        lay.addWidget(self._lbl_phi)
+        lay.addWidget(self._sld_phi_min)
+        lay.addWidget(self._sld_phi_max)
+
+        self._btn_capturar = QPushButton("Capturar entidad")
+        self._btn_capturar.setToolTip("Lo verde pasa a ser una capa nueva.")
+        self._btn_capturar.setEnabled(False)
+        self._btn_capturar.clicked.connect(self.esfera_capturar)
+        lay.addWidget(self._btn_capturar)
+
+        self._actualizar_labels_esfera()
+        return page
+
+    def _actualizar_labels_esfera(self) -> None:
+        self._lbl_tol.setText(f"Tolerancia: {self._sld_tol.value() / 100:.2f} m")
+        self._lbl_phi.setText(f"Recorte angular φ: "
+                              f"{self._sld_phi_min.value()}° – "
+                              f"{self._sld_phi_max.value()}°")
+
+    def _emit_esfera_params(self) -> None:
+        self._actualizar_labels_esfera()
+        self.esfera_params_changed.emit(
+            self._sld_tol.value() / 100.0,
+            float(self._sld_phi_min.value()),
+            float(self._sld_phi_max.value()),
+        )
+
+    def set_esfera_has_selection(self, has: bool) -> None:
+        self._btn_capturar.setEnabled(bool(has))
+
     def _build_page_lazo(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -197,9 +265,9 @@ class CropDock(QDockWidget):
 
     def set_tool(self, tool: str) -> None:
         """Cambia la página de herramienta: 'caja' o 'lazo'."""
-        if tool not in ("caja", "lazo"):
+        if tool not in ("caja", "lazo", "esfera"):
             raise ValueError(f"Herramienta desconocida: {tool}")
-        self._stack.setCurrentIndex(0 if tool == "caja" else 1)
+        self._stack.setCurrentIndex({"caja": 0, "lazo": 1, "esfera": 2}[tool])
         self._tool_box.setTitle(f"Herramienta: {tool.capitalize()}")
 
     def set_lasso_active(self, active: bool) -> None:

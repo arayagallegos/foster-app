@@ -66,6 +66,11 @@ class MainWindow(QMainWindow):
         self._crop_max: np.ndarray | None = None
         self._lasso_mask: np.ndarray | None = None
         self._lasso_ops: list = []   # [(verts, set_op)] para reconstruir el recorte fino
+        # Estado de la primitiva esfera
+        self._esfera = None                 # Esfera ajustada (o None)
+        self._esfera_mask = None            # máscara de lo capturado
+        self._esfera_tol: float = 0.08
+        self._esfera_phi: tuple[float, float] = (0.0, 180.0)
         self._lasso_set_op: str = "union"
 
         self._setup_window()
@@ -161,7 +166,10 @@ class MainWindow(QMainWindow):
         self._act_tool_caja.setData("caja")
         self._act_tool_lazo = QAction("➰  Lazo", self, checkable=True)
         self._act_tool_lazo.setData("lazo")
-        for act in (self._act_tool_caja, self._act_tool_lazo):
+        self._act_tool_esfera = QAction("⚪  Esfera", self, checkable=True)
+        self._act_tool_esfera.setData("esfera")
+        for act in (self._act_tool_caja, self._act_tool_lazo,
+                    self._act_tool_esfera):
             grupo.addAction(act)
             menu_crop.addAction(act)
             act.triggered.connect(self._on_tool_action)
@@ -522,6 +530,8 @@ class MainWindow(QMainWindow):
             dock = CropDock(self)
             dock.tool_apply.connect(self._on_box_apply)
             dock.tool_cancel.connect(self._on_tool_cancel)
+            dock.esfera_params_changed.connect(self._on_esfera_params)
+            dock.esfera_capturar.connect(self._on_esfera_capturar)
             dock.lasso_started.connect(self._on_lasso_started)
             dock.lasso_apply.connect(self._on_lasso_apply)
             dock.lasso_cancel.connect(self._on_lasso_cancel)
@@ -558,7 +568,7 @@ class MainWindow(QMainWindow):
 
     def _activate_tool(self, tool: str) -> None:
         if not self._ensure_layer_stack():
-            for act in (self._act_tool_caja, self._act_tool_lazo):
+            for act in (self._act_tool_caja, self._act_tool_lazo, self._act_tool_esfera):
                 act.setChecked(False)
             return
         self._deactivate_tools(keep_checked=tool)
@@ -573,6 +583,17 @@ class MainWindow(QMainWindow):
                 callback=self._on_crop_bounds_changed,
             )
             self.show_status("Ajusta la caja: VERDE se conserva, ROJO se elimina.")
+        elif tool == "esfera":
+            self._esfera = None
+            dock.set_esfera_has_selection(False)
+            self.viewer.start_sphere_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_esfera_movida,
+            )
+            self.show_status(
+                "Arrastra la esfera sobre la nube. Al soltar se ajusta y se "
+                "marca en VERDE lo que capturaría."
+            )
         else:
             self.show_status(
                 "Elige la operacion y pulsa 'Iniciar lazo' en el panel Recorte."
@@ -583,17 +604,20 @@ class MainWindow(QMainWindow):
         for act in self._acts_vista:
             act.setEnabled(True)
         self.viewer.stop_crop_widget()
+        self.viewer.stop_sphere_widget()
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         self._lasso_mask = None
         self._lasso_ops = []
+        self._esfera = None
+        self._esfera_mask = None
         self._crop_min = None
         self._crop_max = None
         self._active_tool = None
         if self._crop_dock is not None:
             self._crop_dock.set_lasso_active(False)
             self._crop_dock.set_lasso_has_selection(False)
-        for act in (self._act_tool_caja, self._act_tool_lazo):
+        for act in (self._act_tool_caja, self._act_tool_lazo, self._act_tool_esfera):
             if act.data() != keep_checked:
                 act.setChecked(False)
 
@@ -698,6 +722,71 @@ class MainWindow(QMainWindow):
     def _on_tool_cancel(self) -> None:
         self._deactivate_tools()
         self.show_status("Herramienta de recorte cancelada.")
+
+    # ---------- herramienta esfera (primitiva) ---------- #
+
+    def _on_esfera_movida(self, centro, radio: float) -> None:
+        """El usuario soltó la esfera: se AJUSTA a los datos y se previsualiza.
+
+        El ajuste solo ocurre aquí (al soltar). Mover los sliders reaplica la
+        máscara sobre la esfera ya ajustada, sin re-ajustar: es más rápido y
+        evita que la primitiva 'salte' mientras el usuario afina.
+        """
+        from app.modules.primitivas import ajustar_esfera
+
+        if self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        try:
+            self._esfera = ajustar_esfera(pts, centro, radio)
+        except RuntimeError as e:
+            self._esfera = None
+            self._ensure_crop_dock().set_esfera_has_selection(False)
+            self.show_status(str(e))
+            return
+        self.show_status(f"Esfera ajustada: radio {self._esfera.radio:.3f} m.")
+        self._repintar_esfera()
+
+    def _on_esfera_params(self, tol: float, phi_min: float, phi_max: float) -> None:
+        self._esfera_tol = tol
+        self._esfera_phi = (phi_min, phi_max)
+        self._repintar_esfera()
+
+    def _repintar_esfera(self) -> None:
+        """Reaplica la máscara con los parámetros actuales y actualiza el preview."""
+        from app.modules.primitivas import mascara_esfera
+
+        if self._esfera is None or self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        phi_min, phi_max = self._esfera_phi
+        self._esfera_mask = mascara_esfera(
+            pts, self._esfera, self._esfera_tol, phi_min, phi_max
+        )
+        n = int(self._esfera_mask.sum())
+        self._ensure_crop_dock().set_esfera_has_selection(n > 0)
+        self.viewer.preview_split(
+            self._layer_stack.active.pcd, self._esfera_mask,
+            f"layer_{self._layer_stack.active_index}",
+        )
+        self.show_status(
+            f"Esfera r={self._esfera.radio:.3f} m · tol {self._esfera_tol:.2f} m · "
+            f"φ [{phi_min:.0f}, {phi_max:.0f}] → {n:,} puntos capturados."
+        )
+
+    def _on_esfera_capturar(self) -> None:
+        if self._esfera_mask is None or not self._esfera_mask.any():
+            self.show_status("No hay puntos capturados.")
+            return
+        self._apply_split(self._esfera_mask)
+        self._esfera = None
+        self._esfera_mask = None
+        self._ensure_crop_dock().set_esfera_has_selection(False)
+        # La capa activa cambió: se reinicia la esfera sobre lo que queda.
+        if self._active_tool == "esfera" and self._layer_stack is not None:
+            self.viewer.start_sphere_widget(
+                self._layer_stack.active.pcd, callback=self._on_esfera_movida
+            )
 
     # ---------- herramienta lazo ---------- #
 
