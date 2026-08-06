@@ -47,6 +47,42 @@ def _intentar_escribir_e57(path: Path) -> bool:
         return False
 
 
+def test_recachear_recorta_a_la_caja(tmp_path):
+    """El re-cacheo a resolución fina debe quedarse SOLO con lo que cae dentro de
+    la caja indicada. Es lo que permite bajar el vóxel sin que el archivo explote:
+    el entorno (que es la mayor parte de los puntos) se descarta al leer."""
+    from app.core.io import recachear_e57_recortado
+
+    e57 = tmp_path / "mini.e57"
+    if not _intentar_escribir_e57(e57):
+        pytest.skip("pye57 no puede escribir .e57 en este entorno")
+
+    # los puntos del fixture están en [0,5]^3; se recorta a un octante
+    mn, mx = np.array([0.0, 0.0, 0.0]), np.array([2.0, 2.0, 2.0])
+    scans = recachear_e57_recortado(
+        str(e57), tmp_path / "cache_fino", mn, mx,
+        voxel_fino=0.01, voxel_grueso=0.05,
+    )
+    assert scans, "no se recuperó ningún scan"
+    for s in scans:
+        pts = np.asarray(o3d.io.read_point_cloud(str(s.fine_path)).points)
+        assert len(pts) > 0
+        assert np.all(pts >= mn - 1e-6) and np.all(pts <= mx + 1e-6)
+
+
+def test_recachear_reusa_el_cache_si_ya_existe(tmp_path):
+    """La segunda llamada no debe releer el .e57 (que es la operación cara)."""
+    from app.core.io import recachear_e57_recortado
+
+    cache = tmp_path / "cache_fino"
+    _escribir_scan_cache(cache, 0, 500)
+    scans = recachear_e57_recortado(
+        "ruta/inexistente.e57", cache,          # no se toca: el caché ya está
+        np.zeros(3), np.full(3, 5.0),
+    )
+    assert len(scans) == 1
+
+
 def test_e57_scan_count(tmp_path):
     e57 = tmp_path / "mini.e57"
     if not _intentar_escribir_e57(e57):

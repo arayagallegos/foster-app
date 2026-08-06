@@ -21,6 +21,7 @@ class CloudLayer:
     pcd: o3d.geometry.PointCloud
     visible: bool = True
     fine_path: Path | None = None    # versión fina en disco (capas-scan); None = normal
+    descarte: bool = False           # quedó fuera de un recorte: se puede borrar en bloque
 
 
 def _subset(pcd: o3d.geometry.PointCloud, mask: np.ndarray) -> o3d.geometry.PointCloud:
@@ -29,6 +30,13 @@ def _subset(pcd: o3d.geometry.PointCloud, mask: np.ndarray) -> o3d.geometry.Poin
     if pcd.has_colors():
         out.colors = o3d.utility.Vector3dVector(np.asarray(pcd.colors)[mask])
     return out
+
+
+def _slug(nombre: str) -> str:
+    """Nombre de capa → nombre de archivo seguro (los nombres traen comas,
+    paréntesis y puntos que Windows no acepta o que confunden la extensión)."""
+    limpio = "".join(c if c.isalnum() else "_" for c in nombre)
+    return "_".join(filter(None, limpio.split("_")))[:60] or "capa"
 
 
 @dataclass
@@ -103,6 +111,120 @@ class LayerStack:
         recorte.fine_path = rec_path
         descarte.fine_path = des_path
         return recorte, descarte
+
+    def split_visible_fino(self, keep_fn, fine_keep_fn, edits_dir):
+        """
+        Aplica el MISMO criterio de recorte a todas las capas visibles.
+
+        Cada capa que queda partida se reemplaza por sus dos mitades, y ambas
+        heredan el nombre de origen: es lo que permite seguir sabiendo de qué
+        scan viene cada punto y, por lo tanto, separar interior de exterior
+        apagando capas.
+
+        Las capas que quedan enteras de un lado NO se dividen: si todo cae
+        dentro se dejan tal cual, y si todo cae fuera solo se ocultan. Con 35
+        scans la mayoría cae en uno de esos dos casos, y dividirlas igual
+        llenaría la lista de capas vacías.
+
+        A diferencia de `split_active_fino`, la capa de origen no se conserva:
+        con 35 capas, guardar una copia oculta de cada una triplicaría la
+        memoria. No se pierde nada — la unión de las dos mitades es exactamente
+        la capa original.
+
+        `keep_fn(pcd) -> mask bool` y `fine_keep_fn(pcd_fino) -> mask bool|None`
+        los provee el llamador (conoce la caja o el lazo).
+        Devuelve (n_divididas, n_ocultadas, n_intactas).
+        """
+        visibles = [c for c in self.layers if c.visible]
+        if not visibles:
+            raise ValueError("Ninguna capa visible que recortar.")
+
+        # Primero se calculan todas las máscaras y se valida: si el recorte no
+        # conserva nada en ninguna capa, es un error del usuario (caja fuera de
+        # la nube) y no debe dejar el stack a medio modificar.
+        masks: dict[int, np.ndarray] = {}
+        for i, capa in enumerate(self.layers):
+            if not capa.visible:
+                continue
+            masks[i] = np.asarray(keep_fn(capa.pcd), dtype=bool)
+        if not any(m.any() for m in masks.values()):
+            raise ValueError(
+                "El recorte no conserva ningún punto de las capas visibles.")
+
+        self._split_counter += 1
+        k = self._split_counter
+        edits_dir = Path(edits_dir)
+
+        nuevas: list[CloudLayer] = []
+        activa = -1          # índice, no la capa: dos capas pueden compararse iguales
+        n_div = n_ocul = n_intacta = 0
+
+        for i, capa in enumerate(self.layers):
+            mask = masks.get(i)
+            if mask is None:                    # capa oculta: no se toca
+                nuevas.append(capa)
+                continue
+            if mask.all():                      # entera dentro
+                if activa < 0:
+                    activa = len(nuevas)
+                nuevas.append(capa)
+                n_intacta += 1
+                continue
+            if not mask.any():                  # entera fuera
+                capa.visible = False
+                capa.descarte = True
+                nuevas.append(capa)
+                n_ocul += 1
+                continue
+
+            dentro = CloudLayer(name=f"{capa.name} · dentro {k}",
+                                pcd=_subset(capa.pcd, mask))
+            fuera = CloudLayer(name=f"{capa.name} · fuera {k}",
+                               pcd=_subset(capa.pcd, ~mask), visible=False,
+                               descarte=True)
+            if capa.fine_path is not None and Path(capa.fine_path).exists():
+                fino = o3d.io.read_point_cloud(str(capa.fine_path))
+                keep_f = fine_keep_fn(fino)
+                if keep_f is not None:
+                    keep_f = np.asarray(keep_f, dtype=bool)
+                    edits_dir.mkdir(parents=True, exist_ok=True)
+                    base = _slug(capa.name)
+                    p_in = edits_dir / f"{base}_dentro_{k}.ply"
+                    p_out = edits_dir / f"{base}_fuera_{k}.ply"
+                    o3d.io.write_point_cloud(str(p_in), _subset(fino, keep_f))
+                    o3d.io.write_point_cloud(str(p_out), _subset(fino, ~keep_f))
+                    dentro.fine_path, fuera.fine_path = p_in, p_out
+            if activa < 0:
+                activa = len(nuevas)
+            nuevas.extend((dentro, fuera))
+            n_div += 1
+
+        self.layers = nuevas
+        self.active_index = max(activa, 0)
+        return n_div, n_ocul, n_intacta
+
+    def contar_descartes(self) -> int:
+        return sum(1 for c in self.layers if c.descarte)
+
+    def eliminar_descartes(self) -> int:
+        """
+        Borra de una vez todas las capas que quedaron fuera de algún recorte.
+
+        Sin esto hay que eliminarlas una por una, y cada recorte sobre 35 scans
+        puede dejar decenas. Devuelve cuántas se eliminaron.
+        """
+        activa = self.layers[self.active_index] if self.layers else None
+        quedan = [c for c in self.layers if not c.descarte]
+        if not quedan:
+            raise ValueError(
+                "Todas las capas son descartes: eliminarlas dejaría el proyecto vacío.")
+
+        n = len(self.layers) - len(quedan)
+        self.layers = quedan
+        # la capa activa pudo ser un descarte; en ese caso se cae a la primera
+        self.active_index = next(
+            (i for i, c in enumerate(quedan) if c is activa), 0)
+        return n
 
     def set_visible(self, i: int, visible: bool) -> None:
         self.layers[i].visible = bool(visible)

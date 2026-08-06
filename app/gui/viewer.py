@@ -15,6 +15,8 @@ import open3d as o3d
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
+from contextlib import contextmanager
+
 from PyQt6.QtCore import pyqtSignal
 
 
@@ -45,7 +47,8 @@ class Viewer3D(QWidget):
         # Centro compartido de la escena: todos los actores (capas, previews)
         # se dibujan restando este centro para quedar alineados.
         self._scene_center: np.ndarray | None = None
-        self._dimmed_actor: str | None = None
+        self._dimmed_actor: list[str] | None = None   # actores atenuados por el preview
+        self._camara_encuadrada = False   # se encuadra una vez, al cargar
         # Estado del lazo (VTK-based)
         self._lasso_callback = None
         self._lasso_obs_ids: list[int] = []
@@ -174,10 +177,32 @@ class Viewer3D(QWidget):
     # Control de la escena                                                 #
     # ------------------------------------------------------------------ #
 
+    @contextmanager
+    def camara_fija(self):
+        """
+        Congela el punto de vista mientras se repinta la escena.
+
+        Los repintados que ocurren durante una interacción (mover la caja de
+        recorte, arrastrar la esfera) agregan y quitan actores, y VTK puede
+        reencuadrar por su cuenta. Guardar y restaurar la cámara es
+        independiente de cuál sea la llamada que reencuadra, y no cuesta nada
+        si no reencuadra ninguna.
+        """
+        try:
+            pos = self.plotter.camera_position
+        except Exception:
+            pos = None
+        try:
+            yield
+        finally:
+            if pos is not None:
+                self.plotter.camera_position = pos
+
     def clear(self):
         """Elimina todos los objetos de la escena."""
         self.plotter.clear()
         self._active_actors.clear()
+        self._camara_encuadrada = False   # la próxima nube vuelve a encuadrarse
 
     def remove_actor(self, name: str):
         """Elimina un actor por nombre."""
@@ -241,25 +266,30 @@ class Viewer3D(QWidget):
 
         def _pv_callback(box):
             b = box.bounds  # (xmin, xmax, ymin, ymax, zmin, zmax)
-            # Actualizar mesh semi-transparente que muestra las caras de la caja
-            self.plotter.add_mesh(
-                pv.Box(bounds=b),
-                color="#4fc3f7",
-                opacity=0.12,
-                style="surface",
-                name="_crop_box_fill",
-                show_edges=True,
-                edge_color="#4fc3f7",
-                line_width=1,
-            )
-            min_b = np.array([b[0], b[2], b[4]]) + center
-            max_b = np.array([b[1], b[3], b[5]]) + center
-            callback(min_b, max_b)
+            with self.camara_fija():
+                self._dibujar_caja(b, center, callback)
 
         self._crop_widget = self.plotter.add_box_widget(
             callback=_pv_callback,
             bounds=bounds,
         )
+
+    def _dibujar_caja(self, b, center, callback) -> None:
+        """Redibuja la caja semitransparente y avisa los bounds en coords mundo."""
+        self.plotter.add_mesh(
+            pv.Box(bounds=b),
+            color="#4fc3f7",
+            opacity=0.12,
+            style="surface",
+            name="_crop_box_fill",
+            show_edges=True,
+            edge_color="#4fc3f7",
+            line_width=1,
+            reset_camera=False,
+        )
+        min_b = np.array([b[0], b[2], b[4]]) + center
+        max_b = np.array([b[1], b[3], b[5]]) + center
+        callback(min_b, max_b)
 
     def stop_crop_widget(self) -> None:
         """Elimina el box widget y la caja de previsualización del viewer."""
@@ -546,6 +576,8 @@ class Viewer3D(QWidget):
             render_points_as_spheres=True,
             style="points",
             name=name,
+            reset_camera=False,   # el preview se redibuja al mover la caja: si
+                                  # PyVista reencuadra, se pierde el punto de vista
         )
 
     def preview_split(
@@ -555,16 +587,24 @@ class Viewer3D(QWidget):
         source_actor_name: str,
     ) -> None:
         """
-        Previsualiza un recorte sobre la capa activa: VERDE = se conserva,
-        ROJO = se elimina. El actor fuente se atenúa para que dominen los colores.
+        Previsualiza un recorte: VERDE = se conserva, ROJO = se elimina. Los
+        actores fuente se atenúan para que dominen los colores.
+
+        `source_actor_name` puede ser un nombre o una lista de nombres: el
+        recorte se aplica a todas las capas visibles a la vez, no solo a la
+        activa.
         """
         keep_mask = np.asarray(keep_mask, dtype=bool)
         pts = np.asarray(pcd.points)
 
-        actor = self.plotter.actors.get(source_actor_name)
-        if actor is not None:
-            actor.GetProperty().SetOpacity(0.15)
-            self._dimmed_actor = source_actor_name
+        nombres = ([source_actor_name] if isinstance(source_actor_name, str)
+                   else list(source_actor_name))
+        self._dimmed_actor = []
+        for nombre in nombres:
+            actor = self.plotter.actors.get(nombre)
+            if actor is not None:
+                actor.GetProperty().SetOpacity(0.15)
+                self._dimmed_actor.append(nombre)
 
         for name, sel in (("_preview_keep", keep_mask), ("_preview_discard", ~keep_mask)):
             if name in self.plotter.actors:
@@ -579,11 +619,11 @@ class Viewer3D(QWidget):
         for name in ("_preview_keep", "_preview_discard", "_lasso_selection"):
             if name in self.plotter.actors:
                 self.plotter.remove_actor(name)
-        if self._dimmed_actor is not None:
-            actor = self.plotter.actors.get(self._dimmed_actor)
+        for nombre in (self._dimmed_actor or []):
+            actor = self.plotter.actors.get(nombre)
             if actor is not None:
                 actor.GetProperty().SetOpacity(1.0)
-            self._dimmed_actor = None
+        self._dimmed_actor = None
         self.plotter.render()
 
     def show_layers(self, stack) -> None:
@@ -615,6 +655,9 @@ class Viewer3D(QWidget):
                 style="points",
                 name=name,
                 opacity=1.0 if i == stack.active_index else 0.5,
+                # solo se encuadra la primera vez: tras un recorte el usuario
+                # quiere seguir mirando desde donde estaba
+                reset_camera=not self._camara_encuadrada,
             )
             if capa.pcd.has_colors():
                 self.plotter.add_mesh(poly, scalars="RGB", rgb=True, **kwargs)
@@ -623,6 +666,7 @@ class Viewer3D(QWidget):
                     poly, scalars="z", cmap="viridis", show_scalar_bar=False, **kwargs
                 )
             self._active_actors.append(name)
+        self._camara_encuadrada = True
         self.plotter.render()
 
     def set_actor_visibility(self, name: str, visible: bool) -> None:

@@ -196,3 +196,132 @@ def test_nombres_de_split_incrementales():
     assert (recorte1.name, descarte1.name) == ("Recorte 1", "Descarte 1")
     assert (recorte2.name, descarte2.name) == ("Recorte 2", "Descarte 2")
     assert stack.active is recorte2
+
+
+# ---------- recorte aplicado a todas las capas visibles (feature 0.a) ---------- #
+
+def _capa(nombre, pts, visible=True):
+    from app.core.layers import CloudLayer
+    p = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(np.asarray(pts, float)))
+    return CloudLayer(name=nombre, pcd=p, visible=visible)
+
+
+def _stack_de_prueba():
+    from app.core.layers import LayerStack
+    s = LayerStack()
+    s.layers = [
+        _capa("A entera dentro", [[0.1, 0.1, 0.1], [0.2, 0.2, 0.2]]),
+        _capa("B partida",       [[0.3, 0.3, 0.3], [9.0, 9.0, 9.0]]),
+        _capa("C entera fuera",  [[8.0, 8.0, 8.0], [9.0, 9.0, 9.0]]),
+        _capa("D oculta",        [[0.4, 0.4, 0.4], [9.0, 9.0, 9.0]], visible=False),
+    ]
+    s.active_index = 0
+    return s
+
+
+def _dentro_de_la_caja(pcd):
+    pts = np.asarray(pcd.points)
+    return np.all((pts >= 0.0) & (pts <= 1.0), axis=1)
+
+
+def test_split_visible_divide_solo_las_capas_partidas(tmp_path):
+    """Las capas enteras de un lado no se dividen: con 35 scans, dividirlas
+    igual llenaría la lista de capas vacías."""
+    s = _stack_de_prueba()
+    n_div, n_ocul, n_intacta = s.split_visible_fino(
+        _dentro_de_la_caja, lambda f: None, tmp_path)
+    assert (n_div, n_ocul, n_intacta) == (1, 1, 1)
+
+    nombres = [c.name for c in s.layers]
+    assert "A entera dentro" in nombres          # intacta
+    assert "C entera fuera" in nombres           # sigue, pero oculta
+    assert any(n.startswith("B partida · dentro") for n in nombres)
+    assert any(n.startswith("B partida · fuera") for n in nombres)
+    assert "B partida" not in nombres            # la fuente se consume
+
+
+def test_split_visible_conserva_la_procedencia_por_scan(tmp_path):
+    """Sin esto no se puede separar interior de exterior: cada mitad tiene que
+    seguir diciendo de qué scan viene."""
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    hijas = [c.name for c in s.layers if "·" in c.name]
+    assert all(h.startswith("B partida") for h in hijas)
+
+
+def test_split_visible_no_toca_las_capas_ocultas(tmp_path):
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    oculta = [c for c in s.layers if c.name == "D oculta"]
+    assert len(oculta) == 1 and len(oculta[0].pcd.points) == 2
+
+
+def test_split_visible_deja_activa_una_capa_visible(tmp_path):
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    assert s.active.visible
+
+
+def test_split_visible_falla_sin_modificar_si_no_conserva_nada(tmp_path):
+    """Caja fuera de la nube: debe abortar limpio, no dejar el stack a medias."""
+    s = _stack_de_prueba()
+    antes = [c.name for c in s.layers]
+    with pytest.raises(ValueError):
+        s.split_visible_fino(lambda p: np.zeros(len(p.points), bool),
+                             lambda f: None, tmp_path)
+    assert [c.name for c in s.layers] == antes
+
+
+def test_split_visible_recorta_tambien_la_nube_fina(tmp_path):
+    """Si la capa tiene fine_path, las hijas deben quedar con su propio .ply."""
+    s = _stack_de_prueba()
+    fino = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(
+        np.array([[0.5, 0.5, 0.5], [0.6, 0.6, 0.6], [9.0, 9.0, 9.0]])))
+    ruta = tmp_path / "b_fino.ply"
+    o3d.io.write_point_cloud(str(ruta), fino)
+    s.layers[1].fine_path = ruta
+
+    s.split_visible_fino(_dentro_de_la_caja, _dentro_de_la_caja, tmp_path / "edits")
+    dentro = next(c for c in s.layers if c.name.endswith("dentro 1"))
+    pts = np.asarray(o3d.io.read_point_cloud(str(dentro.fine_path)).points)
+    assert len(pts) == 2 and np.all(pts <= 1.0)
+
+
+# ---------- eliminación en bloque de los descartes ---------- #
+
+def test_split_visible_marca_los_descartes(tmp_path):
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    # la mitad "fuera" y la capa que quedó entera fuera
+    assert s.contar_descartes() == 2
+    assert all(c.descarte is False for c in s.layers if c.visible)
+
+
+def test_eliminar_descartes_borra_todas_de_una_vez(tmp_path):
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    n = s.eliminar_descartes()
+    assert n == 2
+    assert s.contar_descartes() == 0
+    assert not any("· fuera" in c.name for c in s.layers)
+    assert "D oculta" in [c.name for c in s.layers]   # oculta ≠ descarte
+
+
+def test_eliminar_descartes_deja_una_activa_valida(tmp_path):
+    s = _stack_de_prueba()
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    s.active_index = next(i for i, c in enumerate(s.layers) if c.descarte)
+    s.eliminar_descartes()
+    assert 0 <= s.active_index < len(s.layers)
+    assert not s.active.descarte
+
+
+def test_eliminar_descartes_no_vacia_el_proyecto():
+    from app.core.layers import LayerStack
+    s = LayerStack()
+    s.layers = [_capa("solo descarte", [[0.0, 0.0, 0.0]])]
+    s.layers[0].descarte = True
+    s.active_index = 0
+    with pytest.raises(ValueError):
+        s.eliminar_descartes()
+    assert len(s.layers) == 1

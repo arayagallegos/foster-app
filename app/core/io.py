@@ -163,11 +163,21 @@ def _scans_desde_cache(cache_dir: Path, voxel_grueso: float) -> list[ScanCacheIn
     return scans
 
 
-def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb):
+def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb,
+                      bounds=None):
     """
     Streaming del .e57: por cada scan → voxel fino → escribe scan_NN.ply en cache_dir,
     y genera la versión gruesa para el visor. float32 y `del` agresivo para no acumular
     memoria (mismo patrón que _load_e57).
+
+    `bounds` = (min_bound, max_bound) opcional, en coordenadas mundo. Si se entrega,
+    cada scan se RECORTA a esa caja antes de voxelizar. Sirve para releer el archivo
+    a resolución fina una vez que el usuario ya delimitó la estructura de interés:
+    antes del recorte se estaría guardando todo el entorno (terreno, árboles,
+    edificios vecinos), que es la mayor parte de los puntos y se descarta igual.
+
+    Nota: se usa `read_scan` (no `read_scan_raw`), que ya devuelve los puntos en
+    coordenadas mundo con la pose del scan aplicada.
     """
     try:
         import pye57
@@ -196,6 +206,19 @@ def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb):
             np.asarray(data["cartesianZ"], dtype=np.float32),
         ])
         del data["cartesianX"], data["cartesianY"], data["cartesianZ"]
+
+        # Recorte a la caja ANTES de voxelizar: descarta el grueso de los puntos
+        # (el entorno) y deja solo la estructura, que es lo que justifica pagar
+        # una resolución más fina.
+        dentro = None
+        if bounds is not None:
+            mn, mx = np.asarray(bounds[0]), np.asarray(bounds[1])
+            dentro = np.all((xyz >= mn) & (xyz <= mx), axis=1)
+            xyz = xyz[dentro]
+            if len(xyz) == 0:
+                del xyz, data
+                continue
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(xyz.astype(np.float64))
         del xyz
@@ -205,6 +228,8 @@ def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb):
                 np.asarray(data["colorGreen"], dtype=np.float32),
                 np.asarray(data["colorBlue"], dtype=np.float32),
             ]) / 255.0
+            if dentro is not None:      # mismo recorte que los puntos
+                cols = cols[dentro]
             pcd.colors = o3d.utility.Vector3dVector(cols.astype(np.float64))
             del cols
         del data
@@ -243,6 +268,37 @@ def load_e57_scans_cached(
             progress_cb(100, "Cargando scans desde caché...")
         return _scans_desde_cache(cache_dir, voxel_grueso)
     return _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb)
+
+
+def recachear_e57_recortado(
+    path: str,
+    cache_dir: Path,
+    min_bound,
+    max_bound,
+    voxel_fino: float = 0.01,
+    voxel_grueso: float = 0.03,
+    progress_cb=None,
+) -> list[ScanCacheInfo]:
+    """
+    Relee el .e57 a resolución fina, quedándose solo con lo que cae dentro de la
+    caja [min_bound, max_bound] (coordenadas mundo).
+
+    Por qué existe: el caché inicial se construye con un vóxel grueso porque debe
+    cubrir toda la escena capturada (terreno, vegetación, construcciones vecinas),
+    donde está la mayor parte de los puntos. Una vez que el usuario delimitó la
+    estructura de interés, se puede pagar una resolución bastante más fina, porque
+    solo se guarda esa región. La resolución importa: el vóxel debe ser bastante
+    menor que los espesores que se quieran distinguir.
+
+    Escribe en un cache_dir NUEVO (no pisa el original), para poder volver atrás.
+    """
+    cache_dir = Path(cache_dir)
+    if cache_dir.exists() and any(cache_dir.glob("scan_*.ply")):
+        if progress_cb:
+            progress_cb(100, "Cargando scans recortados desde caché...")
+        return _scans_desde_cache(cache_dir, voxel_grueso)
+    return _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb,
+                             bounds=(min_bound, max_bound))
 
 
 # ------------------------------------------------------------------ #

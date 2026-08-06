@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout,
     QSplitter, QToolBar, QStatusBar,
     QProgressBar, QLabel, QFileDialog,
-    QMessageBox, QApplication,
+    QMessageBox, QApplication, QInputDialog,
     QMenu, QToolButton,
 )
 from PyQt6.QtCore import Qt, QSettings
@@ -72,7 +72,8 @@ class MainWindow(QMainWindow):
         self._esfera_tol: float = 0.08
         self._esfera_phi: tuple[float, float] = (0.0, 180.0)
         self._lasso_set_op: str = "union"
-
+        # Origen de los scans, para poder re-cachear a otra resolución
+        self._e57_path: str | None = None
         self._setup_window()
         self._setup_central()
         self._setup_toolbar()
@@ -173,6 +174,15 @@ class MainWindow(QMainWindow):
             grupo.addAction(act)
             menu_crop.addAction(act)
             act.triggered.connect(self._on_tool_action)
+        menu_crop.addSeparator()
+        self._act_recachear = QAction("🔍  Re-cachear a resolución fina…", self)
+        self._act_recachear.setToolTip(
+            "Vuelve a leer el .e57 quedándose solo con la caja actual, "
+            "usando un vóxel más fino. Tarda varios minutos."
+        )
+        self._act_recachear.setEnabled(False)
+        self._act_recachear.triggered.connect(self._on_recachear)
+        menu_crop.addAction(self._act_recachear)
         self._btn_crop.setMenu(menu_crop)
         tb.addWidget(self._btn_crop)
 
@@ -371,6 +381,7 @@ class MainWindow(QMainWindow):
     def _cargar_scans_por_capas(self, path: str) -> None:
         """Carga el .e57 como una capa por scan (con caché de dos resoluciones)."""
         cache_dir = Path("output/scans_cache") / Path(path).stem
+        self._e57_path = path      # se necesita para re-cachear a resolución fina
         self.show_status("Cargando scans (1ª vez puede tardar; luego usa caché)...")
         self._set_loading(True)
 
@@ -539,6 +550,7 @@ class MainWindow(QMainWindow):
             dock.layer_activated.connect(self._on_layer_activated)
             dock.layer_removed.connect(self._on_layer_removed)
             dock.layer_restore_requested.connect(self._on_layer_restore)
+            dock.discards_removal_requested.connect(self._on_remove_discards)
             dock.export_requested.connect(self._on_export_visible)
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             self._crop_dock = dock
@@ -691,13 +703,81 @@ class MainWindow(QMainWindow):
             f"'{descarte.name}' ({len(descarte.pcd.points):,} pts) oculta."
         )
 
+    def _on_remove_discards(self) -> None:
+        """Borra de una vez todo lo que quedó fuera de los recortes."""
+        stack = self._layer_stack
+        if stack is None:
+            return
+        n = stack.contar_descartes()
+        if n == 0:
+            self.show_status("No hay capas de descarte.")
+            return
+        resp = QMessageBox.question(
+            self, "Eliminar descartes",
+            f"Se eliminarán {n} capas marcadas como descarte.\n"
+            f"Esto NO se puede deshacer con 'Restaurar eliminada'.\n\n¿Continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            n = stack.eliminar_descartes()
+        except ValueError as e:
+            QMessageBox.warning(self, "Eliminar descartes", str(e))
+            return
+        self._deactivate_tools()
+        self.viewer.show_layers(stack)
+        self._ensure_crop_dock().refresh_layers(stack)
+        self.show_status(f"{n} capas de descarte eliminadas.")
+
+    def _apply_split_visible(self) -> None:
+        """Aplica la caja a todas las capas visibles de una vez (feature 0.a).
+
+        Cada capa partida conserva su nombre de origen en las dos mitades: sin
+        eso se pierde de qué scan viene cada punto, que es justamente lo que
+        permite separar después el interior del exterior apagando capas.
+        """
+        stack = self._layer_stack
+        if stack is None:
+            return
+        try:
+            n_div, n_ocul, n_intacta = stack.split_visible_fino(
+                self._box_keep_fn(), self._fine_keep_fn(), self._EDITS_DIR
+            )
+        except ValueError as e:
+            self.viewer.clear_preview()
+            self.show_status(str(e))
+            return
+
+        self.viewer.clear_preview()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        if self._active_tool == "caja":
+            self.viewer.start_crop_widget(
+                stack.active.pcd, callback=self._on_crop_bounds_changed
+            )
+        self.show_status(
+            f"Recorte aplicado a las capas visibles: {n_div} divididas, "
+            f"{n_intacta} sin cambios, {n_ocul} ocultas por quedar fuera."
+        )
+
     # ---------- herramienta caja ---------- #
 
-    def _box_keep_mask(self) -> np.ndarray | None:
-        if self._layer_stack is None or self._crop_min is None:
-            return None
-        pts = np.asarray(self._layer_stack.active.pcd.points)
-        return np.all((pts >= self._crop_min) & (pts <= self._crop_max), axis=1)
+    def _box_keep_fn(self):
+        """Criterio de la caja, aplicable a cualquier nube (grueso o fino)."""
+        mn, mx = self._crop_min, self._crop_max
+
+        def fn(pcd):
+            pts = np.asarray(pcd.points)
+            return np.all((pts >= mn) & (pts <= mx), axis=1)
+        return fn
+
+    def _capas_visibles(self):
+        """Capas visibles del stack, con su índice (para nombrar los actores)."""
+        stack = self._layer_stack
+        return [(i, c) for i, c in enumerate(stack.layers) if c.visible]
 
     def _on_crop_bounds_changed(
         self, min_bound: np.ndarray, max_bound: np.ndarray
@@ -705,19 +785,92 @@ class MainWindow(QMainWindow):
         """Callback del box widget: preview verde (dentro) / rojo (fuera)."""
         self._crop_min = min_bound
         self._crop_max = max_bound
+        # el re-cacheo necesita una caja: recién ahora tiene sentido ofrecerlo
+        self._act_recachear.setEnabled(self._e57_path is not None)
         stack = self._layer_stack
-        keep = self._box_keep_mask()
-        if stack is None or keep is None:
+        if stack is None or self._crop_min is None:
             return
+
+        # El preview cubre TODAS las capas visibles, no solo la activa: con 35
+        # scans, ver el recorte de a uno no dice nada sobre lo que va a pasar.
+        visibles = self._capas_visibles()
+        if not visibles:
+            return
+        fn = self._box_keep_fn()
+        pts = np.vstack([np.asarray(c.pcd.points) for _, c in visibles])
+        keep = np.concatenate([fn(c.pcd) for _, c in visibles])
+        combinada = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
         self.viewer.preview_split(
-            stack.active.pcd, keep, f"layer_{stack.active_index}"
+            combinada, keep, [f"layer_{i}" for i, _ in visibles]
         )
 
     def _on_box_apply(self) -> None:
-        keep = self._box_keep_mask()
-        if keep is None:
+        if self._layer_stack is None or self._crop_min is None:
             return
-        self._apply_split(keep)
+        self._apply_split_visible()
+
+    def _on_recachear(self) -> None:
+        """
+        Re-lee el .e57 recortado a la caja actual, con un vóxel más fino.
+
+        El caché guarda los puntos YA voxelizados, así que el detalle perdido no
+        se puede recuperar de un .ply local: hay que volver al archivo original.
+        Por eso se avisa del costo antes de empezar.
+        """
+        if self._e57_path is None or self._crop_min is None:
+            QMessageBox.information(
+                self, "Re-cachear",
+                "Primero carga un .e57 por capas y define una caja de recorte.")
+            return
+
+        voxel, ok = QInputDialog.getDouble(
+            self, "Re-cachear a resolución fina",
+            "Tamaño de vóxel en metros:\n\n"
+            "Debe ser bastante menor que el espesor más fino que quieras\n"
+            "distinguir; si no, dos caras cercanas se fusionan en una sola.",
+            0.01, 0.001, 0.10, 3,
+        )
+        if not ok:
+            return
+
+        ext = np.asarray(self._crop_max) - np.asarray(self._crop_min)
+        resp = QMessageBox.question(
+            self, "Confirmar re-cacheo",
+            f"Se volverá a leer el archivo completo, conservando solo la caja de\n"
+            f"{ext[0]:.1f} × {ext[1]:.1f} × {ext[2]:.1f} m, con vóxel de {voxel:.3f} m.\n\n"
+            f"Puede tardar varios minutos. El caché actual no se modifica.\n\n"
+            f"¿Continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if resp != QMessageBox.StandardButton.Yes:
+            return
+
+        self._deactivate_tools()
+        cache_dir = (Path("output/scans_cache")
+                     / f"{Path(self._e57_path).stem}_fino_{voxel:.3f}")
+        self.show_status("Re-cacheando a resolución fina (esto tarda)...")
+        self._set_loading(True)
+
+        from app.core.workers import RecacheWorker
+        worker = RecacheWorker(
+            self._e57_path, cache_dir, self._crop_min, self._crop_max,
+            voxel_fino=voxel, voxel_grueso=max(voxel * 3, 0.03), parent=self,
+        )
+        worker.progress.connect(self._progress.setValue)
+        worker.status.connect(self.show_status)
+        worker.finished.connect(self._on_recache_listo)
+        worker.error.connect(self._on_load_error)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_recache_listo(self, scans) -> None:
+        """Reemplaza el LayerStack por los scans re-cacheados."""
+        self._crop_min = self._crop_max = None      # la caja ya se consumió
+        self._act_recachear.setEnabled(False)
+        self._on_scan_layers_loaded(scans)
+        self.show_status(
+            f"{len(scans)} scans re-cacheados a resolución fina dentro de la caja.")
 
     def _on_tool_cancel(self) -> None:
         self._deactivate_tools()
@@ -765,10 +918,11 @@ class MainWindow(QMainWindow):
         )
         n = int(self._esfera_mask.sum())
         self._ensure_crop_dock().set_esfera_has_selection(n > 0)
-        self.viewer.preview_split(
-            self._layer_stack.active.pcd, self._esfera_mask,
-            f"layer_{self._layer_stack.active_index}",
-        )
+        with self.viewer.camara_fija():
+            self.viewer.preview_split(
+                self._layer_stack.active.pcd, self._esfera_mask,
+                f"layer_{self._layer_stack.active_index}",
+            )
         self.show_status(
             f"Esfera r={self._esfera.radio:.3f} m · tol {self._esfera_tol:.2f} m · "
             f"φ [{phi_min:.0f}, {phi_max:.0f}] → {n:,} puntos capturados."

@@ -125,6 +125,54 @@ class ScanLayersWorker(QThread):
             self.error.emit(str(ex))
 
 
+class RecacheWorker(QThread):
+    """
+    Re-lee el .e57 quedándose solo con lo que cae dentro de una caja, y lo
+    cachea con un vóxel más fino. Es la operación más cara de la aplicación
+    (hay que releer el archivo completo, porque el caché guarda los puntos ya
+    voxelizados y ese detalle no se puede recuperar de otra forma), así que va
+    obligatoriamente en un hilo aparte.
+    """
+
+    finished = pyqtSignal(object)   # list[ScanCacheInfo]
+    error    = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    status   = pyqtSignal(str)
+
+    def __init__(self, path, cache_dir, min_bound, max_bound,
+                 voxel_fino=0.01, voxel_grueso=0.03, parent=None):
+        super().__init__(parent)
+        self._path = path
+        self._cache_dir = cache_dir
+        self._min_bound = min_bound
+        self._max_bound = max_bound
+        self._voxel_fino = voxel_fino
+        self._voxel_grueso = voxel_grueso
+
+    def run(self):
+        try:
+            from app.core.io import recachear_e57_recortado
+
+            def cb(pct, msg):
+                self.progress.emit(int(pct))
+                self.status.emit(msg)
+
+            scans = recachear_e57_recortado(
+                self._path, self._cache_dir, self._min_bound, self._max_bound,
+                voxel_fino=self._voxel_fino, voxel_grueso=self._voxel_grueso,
+                progress_cb=cb,
+            )
+            if not scans:
+                self.error.emit(
+                    "El recorte no dejó puntos en ningún scan. "
+                    "Revisa que la caja esté sobre la estructura."
+                )
+                return
+            self.finished.emit(scans)
+        except Exception as ex:
+            self.error.emit(str(ex))
+
+
 class BaseWorker(QThread):
     """
     Worker genérico para operaciones futuras (ICP, Poisson, etc.).

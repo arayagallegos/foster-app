@@ -9,6 +9,7 @@ Colores de previsualización en toda la app: VERDE = se conserva, ROJO = se elim
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup, QDockWidget, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
@@ -67,6 +68,7 @@ class CropDock(QDockWidget):
     layer_activated = pyqtSignal(int)
     layer_removed = pyqtSignal(int)
     layer_restore_requested = pyqtSignal()
+    discards_removal_requested = pyqtSignal()
     export_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -132,6 +134,16 @@ class CropDock(QDockWidget):
         fc.addWidget(self._btn_remove_layer)
         fc.addWidget(self._btn_restore_layer)
         capas_layout.addWidget(fila_capas)
+
+        # Un recorte sobre 35 scans puede dejar decenas de capas fuera; borrarlas
+        # una a una es impracticable.
+        self._btn_remove_discards = QPushButton("Eliminar descartes")
+        self._btn_remove_discards.setToolTip(
+            "Elimina de una vez todas las capas marcadas con 🗑 "
+            "(lo que quedó fuera de los recortes).")
+        self._btn_remove_discards.setEnabled(False)
+        self._btn_remove_discards.clicked.connect(self.discards_removal_requested)
+        capas_layout.addWidget(self._btn_remove_discards)
         layout.addWidget(box_capas)
 
         # ---------- Exportar ---------- #
@@ -287,14 +299,22 @@ class CropDock(QDockWidget):
             self._layer_list.clear()
             for capa in stack:
                 n = len(capa.pcd.points)
-                item = QListWidgetItem(f"{capa.name} ({n:,} pts)")
+                marca = "🗑 " if getattr(capa, "descarte", False) else ""
+                item = QListWidgetItem(f"{marca}{capa.name} ({n:,} pts)")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(
                     Qt.CheckState.Checked if capa.visible else Qt.CheckState.Unchecked
                 )
+                if getattr(capa, "descarte", False):
+                    item.setForeground(QColor("#8a6060"))   # atenuado: es basura
                 self._layer_list.addItem(item)
             self._layer_list.setCurrentRow(stack.active_index)
             self._btn_remove_layer.setEnabled(len(stack) > 1)
+
+            n_desc = stack.contar_descartes()
+            self._btn_remove_discards.setEnabled(0 < n_desc < len(stack))
+            self._btn_remove_discards.setText(
+                f"Eliminar descartes ({n_desc})" if n_desc else "Eliminar descartes")
         finally:
             self._updating_layers = False
 
