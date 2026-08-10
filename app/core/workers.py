@@ -173,6 +173,31 @@ class RecacheWorker(QThread):
             self.error.emit(str(ex))
 
 
+class DbscanWorker(QThread):
+    """Agrupa por densidad en un hilo aparte.
+
+    Aunque `clusterizar` submuestrea, sobre una capa grande sigue costando
+    segundos: bloquear la UI dejaría la ventana congelada sin explicación.
+    """
+
+    finished = pyqtSignal(object)   # np.ndarray de etiquetas
+    error    = pyqtSignal(str)
+
+    def __init__(self, pts, eps: float, min_points: int, parent=None):
+        super().__init__(parent)
+        self._pts = pts
+        self._eps = eps
+        self._min_points = min_points
+
+    def run(self):
+        try:
+            from app.modules.clusters import clusterizar
+            self.finished.emit(
+                clusterizar(self._pts, eps=self._eps, min_points=self._min_points))
+        except Exception as ex:
+            self.error.emit(str(ex))
+
+
 class BaseWorker(QThread):
     """
     Worker genérico para operaciones futuras (ICP, Poisson, etc.).
