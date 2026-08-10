@@ -13,7 +13,7 @@ from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup, QDockWidget, QGroupBox, QHBoxLayout, QLabel, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
-    QStackedWidget, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QCheckBox, QStackedWidget, QStyledItemDelegate, QVBoxLayout, QWidget,
 )
 
 # (etiqueta, valor de la senal, explicacion para tooltip y dialogo de ayuda)
@@ -98,6 +98,10 @@ class CropDock(QDockWidget):
     dbscan_capturar = pyqtSignal()
     dbscan_eliminar = pyqtSignal()
 
+    simetria_params_changed = pyqtSignal(float, bool)  # tolerancia, acotar zona
+    simetria_refinar = pyqtSignal()
+    simetria_aplicar = pyqtSignal()
+
 
     lasso_started = pyqtSignal(str)   # set_op
     lasso_apply = pyqtSignal()
@@ -152,6 +156,7 @@ class CropDock(QDockWidget):
         self._stack.addWidget(self._build_page_cilindro())  # index 4
         self._stack.addWidget(self._build_page_cono())      # index 5
         self._stack.addWidget(self._build_page_dbscan())    # index 6
+        self._stack.addWidget(self._build_page_simetria())  # index 7
         tool_layout.addWidget(self._stack)
         layout.addWidget(self._tool_box)
 
@@ -692,6 +697,86 @@ class CropDock(QDockWidget):
         self._btn_db_capturar.setEnabled(False)
         self._btn_db_eliminar.setEnabled(False)
 
+    def _build_page_simetria(self) -> QWidget:
+        """Reparación por reflexión especular.
+
+        Completa zonas mal escaneadas reflejando material real del lado bien
+        cubierto. Es REPARACIÓN: la salida sigue siendo una nube de puntos, no
+        una malla.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(QLabel("Coloca el plano de simetría más o menos donde va\n"
+                             "y pulsa Refinar."))
+
+        # La concordancia es el indicador de confianza: va destacada, porque es
+        # lo que dice si el material generado tiene respaldo o es invención.
+        self._lbl_si_conc = QLabel("Concordancia: —")
+        self._lbl_si_conc.setStyleSheet("font-size: 15px; font-weight: 600;")
+        lay.addWidget(self._lbl_si_conc)
+        self._lbl_si_ayuda = QLabel(
+            "Fracción de los reflejos que cae sobre puntos reales. Alta = la "
+            "simetría existe y el plano es correcto.")
+        self._lbl_si_ayuda.setWordWrap(True)
+        self._lbl_si_ayuda.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        lay.addWidget(self._lbl_si_ayuda)
+
+        self._lbl_si_tol = QLabel()
+        self._sld_si_tol = QSlider(Qt.Orientation.Horizontal)
+        self._sld_si_tol.setRange(1, 30)          # 0.01 .. 0.30 m
+        self._sld_si_tol.setValue(5)
+        self._sld_si_tol.setToolTip(
+            "A qué distancia un reflejo se considera encima de un punto real.")
+        lay.addWidget(self._lbl_si_tol)
+        lay.addWidget(self._sld_si_tol)
+
+        self._chk_si_zona = QCheckBox("Acotar a una caja")
+        self._chk_si_zona.setToolTip(
+            "Limita dónde se aplica la simetría. Sin acotar, una estructura "
+            "simétrica solo en parte genera material falso en el resto.")
+        lay.addWidget(self._chk_si_zona)
+
+        self._sld_si_tol.valueChanged.connect(self._emit_simetria_params)
+        self._chk_si_zona.toggled.connect(self._emit_simetria_params)
+
+        self._btn_si_refinar = QPushButton("Refinar plano")
+        self._btn_si_refinar.setToolTip(
+            "Ajusta el plano maximizando la concordancia. Puede tardar.")
+        self._btn_si_refinar.clicked.connect(self.simetria_refinar)
+        lay.addWidget(self._btn_si_refinar)
+
+        self._btn_si_aplicar = QPushButton("Crear capa de relleno")
+        self._btn_si_aplicar.setToolTip(
+            "Los puntos generados van a una capa aparte, para poder revisarlos "
+            "o descartarlos. Únelos a la entidad cuando estés conforme.")
+        self._btn_si_aplicar.setEnabled(False)
+        self._btn_si_aplicar.clicked.connect(self.simetria_aplicar)
+        lay.addWidget(self._btn_si_aplicar)
+
+        self._actualizar_labels_simetria()
+        return page
+
+    def _actualizar_labels_simetria(self) -> None:
+        self._lbl_si_tol.setText(
+            f"Tolerancia: {self._sld_si_tol.value() / 100:.2f} m")
+
+    def _emit_simetria_params(self) -> None:
+        self._actualizar_labels_simetria()
+        self.simetria_params_changed.emit(self._sld_si_tol.value() / 100.0,
+                                          self._chk_si_zona.isChecked())
+
+    def set_simetria_concordancia(self, conc: float | None, n_relleno: int = 0) -> None:
+        if conc is None:
+            self._lbl_si_conc.setText("Concordancia: —")
+        else:
+            self._lbl_si_conc.setText(
+                f"Concordancia: {100 * conc:.1f} %  ·  relleno {n_relleno:,} pts")
+        self._btn_si_aplicar.setEnabled(n_relleno > 0)
+
+    def simetria_acota_zona(self) -> bool:
+        return self._chk_si_zona.isChecked()
+
     def _build_page_lazo(self) -> QWidget:
         page = QWidget()
         lay = QVBoxLayout(page)
@@ -729,7 +814,7 @@ class CropDock(QDockWidget):
     # ------------------------------------------------------------------ #
 
     PAGINAS = {"caja": 0, "lazo": 1, "esfera": 2, "plano": 3, "cilindro": 4,
-               "cono": 5, "dbscan": 6}
+               "cono": 5, "dbscan": 6, "simetria": 7}
 
     def set_tool(self, tool: str) -> None:
         """Cambia la página de herramienta."""

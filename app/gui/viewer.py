@@ -1064,6 +1064,26 @@ class Viewer3D(QWidget):
         self._dimmed_actor = None
         self._aplicar_estilo_nube()
 
+    def mostrar_relleno(self, pts) -> None:
+        """Dibuja los puntos que la reparación agregaría, en un color propio.
+
+        No usa el verde/rojo del recorte a propósito: allí el verde es "se
+        conserva lo que ya existe" y aquí es "esto se va a inventar". Confundir
+        ambos llevaría a aceptar material fabricado creyendo que es medido.
+        """
+        pts = np.asarray(pts)
+        if len(pts) == 0:
+            self.ocultar_relleno()
+            return
+        self._add_points_actor(pts, "_relleno", "#4fc3f7",
+                               point_size=max(self._tamano_punto, 2.0))
+        self.plotter.render()
+
+    def ocultar_relleno(self) -> None:
+        if "_relleno" in self.plotter.actors:
+            self.plotter.remove_actor("_relleno")
+            self.plotter.render()
+
     def clear_preview(self) -> None:
         """Quita los actores de previsualización y restaura la opacidad."""
         for name in self.ACTORES_PREVIEW:

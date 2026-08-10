@@ -98,6 +98,11 @@ class MainWindow(QMainWindow):
         self._db_etiquetas_filtradas = None
         self._db_seleccion: list[int] = []
         self._db_umbral: int = 0
+        # Estado de la reparación por simetría
+        self._si_plano = None
+        self._si_relleno = None
+        self._si_tol: float = 0.05
+        self._si_zona: bool = False
         self._lasso_set_op: str = "union"
         # Origen de los scans, para poder re-cachear a otra resolución
         self._e57_path: str | None = None
@@ -235,18 +240,20 @@ class MainWindow(QMainWindow):
         self._act_tool_cilindro = _accion("⬭  Cilindro", "cilindro")
         self._act_tool_cono = _accion("◺  Cono", "cono")
         self._act_tool_dbscan = _accion("⁙  Agrupar (DBSCAN)", "dbscan")
+        self._act_tool_simetria = _accion("⧉  Reparar por simetría", "simetria")
         for act in (self._act_tool_esfera, self._act_tool_plano,
                     self._act_tool_cilindro, self._act_tool_cono):
             menu_seg.addAction(act)
         menu_seg.addSeparator()
         menu_seg.addAction(self._act_tool_dbscan)
+        menu_seg.addAction(self._act_tool_simetria)
         self._btn_seg.setMenu(menu_seg)
         tb.addWidget(self._btn_seg)
 
         self._acts_tool = (self._act_tool_caja, self._act_tool_lazo,
                            self._act_tool_esfera, self._act_tool_plano,
                            self._act_tool_cilindro, self._act_tool_cono,
-                           self._act_tool_dbscan)
+                           self._act_tool_dbscan, self._act_tool_simetria)
 
         tb.addSeparator()
 
@@ -724,6 +731,9 @@ class MainWindow(QMainWindow):
             dock.dbscan_capturar.connect(self._on_dbscan_capturar)
             dock.dbscan_eliminar.connect(self._on_dbscan_eliminar)
             dock.layers_merge_requested.connect(self._on_layers_merge)
+            dock.simetria_params_changed.connect(self._on_simetria_params)
+            dock.simetria_refinar.connect(self._on_simetria_refinar)
+            dock.simetria_aplicar.connect(self._on_simetria_aplicar)
             dock.export_requested.connect(self._on_export_visible)
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             self._crop_dock = dock
@@ -821,6 +831,17 @@ class MainWindow(QMainWindow):
                 "Ajusta eps y min_points, y pulsa 'Agrupar'. Es la operacion "
                 "cara, por eso no se dispara al mover los sliders."
             )
+        elif tool == "simetria":
+            self._si_plano = self._si_relleno = None
+            dock.set_simetria_concordancia(None)
+            self.viewer.start_plane_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_simetria_plano_movido,
+            )
+            self.show_status(
+                "Coloca el plano de simetria mas o menos donde va y pulsa "
+                "'Refinar plano'. La concordancia dice si la simetria existe."
+            )
         else:
             self.show_status(
                 "Elige la operacion y pulsa 'Iniciar lazo' en el panel Recorte."
@@ -846,7 +867,9 @@ class MainWindow(QMainWindow):
         self._cono = self._cono_base = self._cono_mask = None
         self._db_etiquetas = self._db_etiquetas_filtradas = None
         self._db_seleccion = []
+        self._si_plano = self._si_relleno = None
         self.viewer.ocultar_clusters()
+        self.viewer.ocultar_relleno()
         self._crop_min = None
         self._crop_max = None
         self._active_tool = None
@@ -1744,6 +1767,111 @@ class MainWindow(QMainWindow):
         self._ensure_crop_dock().refresh_layers(self._layer_stack)
         self.show_status(f"{len(indices)} capas unidas en "
                          f"'{capa.name}' ({len(capa.pcd.points):,} pts).")
+
+    # ---------- reparación por simetría ---------- #
+
+    def _zona_simetria(self):
+        """Caja que acota dónde aplica la simetría, o None."""
+        if not self._si_zona or self._crop_min is None:
+            return None
+        return (self._crop_min, self._crop_max)
+
+    def _on_simetria_plano_movido(self, punto, normal) -> None:
+        from app.modules.simetria import PlanoSimetria
+        self._si_plano = PlanoSimetria(normal=normal, punto=punto)
+        self._evaluar_simetria()
+
+    def _on_simetria_params(self, tolerancia: float, zona: bool) -> None:
+        self._si_tol = tolerancia
+        self._si_zona = zona
+        if zona and self._crop_min is None and self._layer_stack is not None:
+            # la caja del recorte es la que acota: si no hay ninguna, se ofrece
+            self.viewer.start_crop_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_crop_bounds_changed)
+            self.show_status("Ajusta la caja para acotar dónde aplica la simetría.")
+        self._evaluar_simetria()
+
+    def _evaluar_simetria(self) -> None:
+        """Recalcula concordancia y relleno con el plano actual.
+
+        No refina: refinar es la operación cara y va en su propio botón. Esto
+        solo mide, para que el usuario vea de inmediato si va por buen camino.
+        """
+        from app.modules.simetria import concordancia, puntos_a_rellenar
+
+        if self._si_plano is None or self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        zona = self._zona_simetria()
+        conc = concordancia(pts, self._si_plano, self._si_tol, zona)
+        self._si_relleno = puntos_a_rellenar(pts, self._si_plano, self._si_tol, zona)
+        n = len(self._si_relleno)
+        self._ensure_crop_dock().set_simetria_concordancia(conc, n)
+        with self.viewer.camara_fija():
+            self.viewer.mostrar_relleno(self._si_relleno)
+        self.show_status(
+            f"Concordancia {100*conc:.1f}% · el relleno agregaría {n:,} puntos. "
+            + ("Concordancia baja: revisa el plano antes de aplicar."
+               if conc < 0.5 else "Pulsa 'Refinar plano' para afinarlo.")
+        )
+
+    def _on_simetria_refinar(self) -> None:
+        if self._si_plano is None or self._layer_stack is None:
+            self.show_status("Coloca primero el plano de simetría.")
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        self.show_status(f"Refinando el plano sobre {len(pts):,} puntos...")
+        self._set_loading(True)
+
+        from app.core.workers import SimetriaWorker
+        worker = SimetriaWorker(pts, self._si_plano, self._si_tol,
+                                self._zona_simetria(), parent=self)
+        worker.finished.connect(self._on_simetria_refinado)
+        worker.error.connect(self._on_load_error)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_simetria_refinado(self, plano, conc: float) -> None:
+        self._set_loading(False)
+        self._si_plano = plano
+        self._evaluar_simetria()
+
+    def _on_simetria_aplicar(self) -> None:
+        """El relleno va a una CAPA APARTE, no se mezcla con los datos medidos.
+
+        Es material generado: mezclarlo con lo medido haría imposible saber
+        después qué se midió y qué se inventó. Una vez revisado, el usuario lo
+        une a la entidad con 'Unir seleccionadas'.
+        """
+        import open3d as o3d
+        from app.core.layers import CloudLayer
+
+        if self._si_relleno is None or len(self._si_relleno) == 0:
+            self.show_status("No hay puntos de relleno que crear.")
+            return
+        stack = self._layer_stack
+        nombre = f"{stack.active.name} · relleno"
+        capa = CloudLayer(
+            name=nombre,
+            pcd=o3d.geometry.PointCloud(
+                o3d.utility.Vector3dVector(self._si_relleno)),
+        )
+        i = stack.active_index + 1
+        stack.layers.insert(i, capa)
+        stack.active_index = i
+
+        n = len(self._si_relleno)
+        self._si_plano = self._si_relleno = None
+        self.viewer.ocultar_relleno()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.set_simetria_concordancia(None)
+        self.show_status(
+            f"Capa '{nombre}' creada con {n:,} puntos generados. Revísala y "
+            "únela a la entidad si estás conforme."
+        )
 
     # ---------- herramienta lazo ---------- #
 
