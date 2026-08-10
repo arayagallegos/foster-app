@@ -25,7 +25,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QToolBar, QStatusBar,
     QProgressBar, QLabel, QFileDialog,
     QMessageBox, QApplication, QInputDialog,
-    QMenu, QToolButton,
+    QMenu, QToolButton, QSlider, QVBoxLayout, QWidgetAction,
 )
 from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
@@ -71,11 +71,38 @@ class MainWindow(QMainWindow):
         self._esfera_mask = None            # máscara de lo capturado
         self._esfera_tol: float = 0.08
         self._esfera_phi: tuple[float, float] = (0.0, 180.0)
+        # Estado de la primitiva plano
+        self._plano = None
+        self._plano_base = None      # el plano tal como lo dejó el ajuste
+        self._plano_mask = None
+        self._plano_offset: float = 0.0
+        self._plano_tol: float = 0.08
+        self._plano_radio: float = 5.0
+        self._plano_pos = None       # (punto, normal) del widget, para re-ajustar
+        # Estado de la primitiva cilindro
+        self._cilindro = None
+        self._cilindro_mask = None
+        self._cilindro_tol: float = 0.08
+        self._cilindro_h: tuple[float, float] = (-np.inf, np.inf)
+        self._cilindro_theta: tuple[float, float] = (0.0, 360.0)
+        # Estado de la primitiva cono
+        self._cono = None
+        self._cono_mask = None
+        self._cono_tol: float = 0.08
+        self._cono_h: tuple[float, float] = (-np.inf, np.inf)
+        self._cono_theta: tuple[float, float] = (0.0, 360.0)
+        self._cono_base = None          # el cono tal como lo dejó el ajuste
+        self._cono_apertura: float = 0.0
+        # Estado de DBSCAN
+        self._db_etiquetas = None        # etiqueta de cluster por punto
+        self._db_etiquetas_filtradas = None
+        self._db_seleccion: list[int] = []
+        self._db_umbral: int = 0
         self._lasso_set_op: str = "union"
         # Origen de los scans, para poder re-cachear a otra resolución
         self._e57_path: str | None = None
         self._setup_window()
-        self._setup_central()
+        self._setup_central()          # aquí se crea self.viewer
         self._setup_toolbar()
         self._setup_statusbar()
         self._apply_stylesheet()
@@ -147,6 +174,9 @@ class MainWindow(QMainWindow):
         act_front.triggered.connect(self.viewer.set_view_front)
         tb.addAction(act_front)
 
+        tb.addWidget(self._menu_camara())
+        tb.addWidget(self._menu_visibilidad())
+
         # Cambiar la vista con un lazo a medio dibujar mezclaría vértices de
         # cámaras distintas: se bloquean mientras el lazo está activo.
         self._acts_vista = (act_iso, act_top, act_front)
@@ -161,19 +191,24 @@ class MainWindow(QMainWindow):
         self._btn_crop.setEnabled(False)
 
         menu_crop = QMenu(self._btn_crop)
+        # Un solo grupo para los DOS menús: las herramientas siguen siendo
+        # mutuamente excluyentes aunque estén repartidas en dos botones.
         grupo = QActionGroup(self)
         grupo.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)
-        self._act_tool_caja = QAction("⬜  Caja", self, checkable=True)
-        self._act_tool_caja.setData("caja")
-        self._act_tool_lazo = QAction("➰  Lazo", self, checkable=True)
-        self._act_tool_lazo.setData("lazo")
-        self._act_tool_esfera = QAction("⚪  Esfera", self, checkable=True)
-        self._act_tool_esfera.setData("esfera")
-        for act in (self._act_tool_caja, self._act_tool_lazo,
-                    self._act_tool_esfera):
+
+        def _accion(etiqueta: str, clave: str) -> QAction:
+            act = QAction(etiqueta, self, checkable=True)
+            act.setData(clave)
             grupo.addAction(act)
-            menu_crop.addAction(act)
             act.triggered.connect(self._on_tool_action)
+            return act
+
+        # Recortar: quitar lo que sobra de la nube
+        self._act_tool_caja = _accion("⬜  Caja", "caja")
+        self._act_tool_lazo = _accion("➰  Lazo", "lazo")
+        for act in (self._act_tool_caja, self._act_tool_lazo):
+            menu_crop.addAction(act)
+
         menu_crop.addSeparator()
         self._act_recachear = QAction("🔍  Re-cachear a resolución fina…", self)
         self._act_recachear.setToolTip(
@@ -186,6 +221,33 @@ class MainWindow(QMainWindow):
         self._btn_crop.setMenu(menu_crop)
         tb.addWidget(self._btn_crop)
 
+        # Segmentar: extraer entidades de lo que queda
+        self._btn_seg = QToolButton()
+        self._btn_seg.setText("◈  Segmentar")
+        self._btn_seg.setToolTip(
+            "Primitivas que se ajustan a los datos y capturan una entidad")
+        self._btn_seg.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self._btn_seg.setEnabled(False)
+
+        menu_seg = QMenu(self._btn_seg)
+        self._act_tool_esfera = _accion("⚪  Esfera", "esfera")
+        self._act_tool_plano = _accion("▱  Plano", "plano")
+        self._act_tool_cilindro = _accion("⬭  Cilindro", "cilindro")
+        self._act_tool_cono = _accion("◺  Cono", "cono")
+        self._act_tool_dbscan = _accion("⁙  Agrupar (DBSCAN)", "dbscan")
+        for act in (self._act_tool_esfera, self._act_tool_plano,
+                    self._act_tool_cilindro, self._act_tool_cono):
+            menu_seg.addAction(act)
+        menu_seg.addSeparator()
+        menu_seg.addAction(self._act_tool_dbscan)
+        self._btn_seg.setMenu(menu_seg)
+        tb.addWidget(self._btn_seg)
+
+        self._acts_tool = (self._act_tool_caja, self._act_tool_lazo,
+                           self._act_tool_esfera, self._act_tool_plano,
+                           self._act_tool_cilindro, self._act_tool_cono,
+                           self._act_tool_dbscan)
+
         tb.addSeparator()
 
         # --- Limpiar escena ---
@@ -193,6 +255,101 @@ class MainWindow(QMainWindow):
         act_clear.setToolTip("Limpiar escena y proyecto actual")
         act_clear.triggered.connect(self._on_clear)
         tb.addAction(act_clear)
+
+    def _habilitar_herramientas(self, activo: bool) -> None:
+        """Recortar y Segmentar dependen de lo mismo: que haya nube cargada."""
+        self._btn_crop.setEnabled(bool(activo))
+        self._btn_seg.setEnabled(bool(activo))
+
+    def _menu_camara(self) -> QToolButton:
+        """Menú Cámara: modos de navegación, ambos apagados por defecto.
+
+        Se dejan desactivados de entrada porque la órbita es lo que el usuario
+        espera al abrir un visor 3D; activarlos es una decisión suya, no algo
+        que tenga que deshacer.
+        """
+        btn = QToolButton()
+        btn.setText("Cámara")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+
+        self._act_fps = QAction("Vista libre", self, checkable=True)
+        self._act_fps.setToolTip(
+            "Manteniendo el botón derecho, mover el mouse gira la cámara como en "
+            "un juego en primera persona. Al soltarlo recuperas el cursor para "
+            "agarrar los manipuladores. Activa también WASD.")
+        self._act_fps.toggled.connect(self._on_fps_toggled)
+        menu.addAction(self._act_fps)
+
+        self._act_wasd = QAction("Navegación con teclado (WASD)", self, checkable=True)
+        self._act_wasd.setToolTip(
+            "W/S avanzar y retroceder, A/D lateral, E/Q subir y bajar. "
+            "Con Shift el paso es 4× más grande. El paso se adapta a la "
+            "distancia: cerca de la superficie es fino.")
+        self._act_wasd.toggled.connect(self._on_wasd_toggled)
+        menu.addAction(self._act_wasd)
+
+        btn.setMenu(menu)
+        return btn
+
+    def _menu_visibilidad(self) -> QToolButton:
+        """Menú Visibilidad: opacidad y tamaño de punto.
+
+        Los sliders van dentro del menú con QWidgetAction, no como diálogo: hay
+        que poder arrastrarlos viendo el efecto en la nube, y un diálogo modal
+        taparía justo lo que se está ajustando.
+        """
+        btn = QToolButton()
+        btn.setText("Visibilidad")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+
+        panel = QWidget()
+        lay = QVBoxLayout(panel)
+        lay.setContentsMargins(10, 8, 10, 8)
+
+        self._lbl_opacidad = QLabel()
+        self._sld_opacidad = QSlider(Qt.Orientation.Horizontal)
+        self._sld_opacidad.setRange(5, 100)
+        self._sld_opacidad.setValue(100)
+        self._sld_opacidad.setMinimumWidth(180)
+        self._sld_opacidad.setToolTip(
+            "Transparencia de la nube. Bájala para ver los manipuladores de una "
+            "primitiva cuando quedan dentro de la estructura.")
+        self._sld_opacidad.valueChanged.connect(self._on_opacidad)
+        lay.addWidget(self._lbl_opacidad)
+        lay.addWidget(self._sld_opacidad)
+
+        self._lbl_punto = QLabel()
+        self._sld_punto = QSlider(Qt.Orientation.Horizontal)
+        self._sld_punto.setRange(1, 8)
+        self._sld_punto.setValue(2)
+        self._sld_punto.setMinimumWidth(180)
+        self._sld_punto.setToolTip(
+            "Tamaño del punto en píxeles. Puntos chicos dejan huecos entre sí y "
+            "hacen visible la geometría de detrás.")
+        self._sld_punto.valueChanged.connect(self._on_tamano_punto)
+        lay.addWidget(self._lbl_punto)
+        lay.addWidget(self._sld_punto)
+
+        self._actualizar_labels_visibilidad()
+        accion = QWidgetAction(menu)
+        accion.setDefaultWidget(panel)
+        menu.addAction(accion)
+        btn.setMenu(menu)
+        return btn
+
+    def _actualizar_labels_visibilidad(self) -> None:
+        self._lbl_opacidad.setText(f"Opacidad de la nube: {self._sld_opacidad.value()} %")
+        self._lbl_punto.setText(f"Tamaño de punto: {self._sld_punto.value()} px")
+
+    def _on_opacidad(self, v: int) -> None:
+        self._actualizar_labels_visibilidad()
+        self.viewer.set_opacidad_nube(v / 100.0)
+
+    def _on_tamano_punto(self, v: int) -> None:
+        self._actualizar_labels_visibilidad()
+        self.viewer.set_tamano_punto(float(v))
 
     def _setup_central(self):
         """Crea el layout central: viewer + panel de info en un splitter."""
@@ -410,7 +567,7 @@ class MainWindow(QMainWindow):
         dock = self._ensure_crop_dock()
         dock.refresh_layers(stack)
         dock.show()
-        self._btn_crop.setEnabled(True)
+        self._habilitar_herramientas(True)
         self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — scans")
         self.show_status(f"{len(scans)} scans cargados como capas. "
                          "Apaga los interiores y usa 'Exportar visibles'.")
@@ -433,7 +590,7 @@ class MainWindow(QMainWindow):
             self.project.clear()
             self.info_panel.update_from_project(self.project)
             self._points_label.setText("")
-            self._btn_crop.setEnabled(False)
+            self._habilitar_herramientas(False)
             self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — Sin título")
             self.show_status("Escena limpiada.")
 
@@ -492,7 +649,7 @@ class MainWindow(QMainWindow):
             f"{self.APP_NAME} v{self.VERSION} — {self.project.name}"
         )
         self.show_status(f"Cargado: {path}")
-        self._btn_crop.setEnabled(True)
+        self._habilitar_herramientas(True)
         # Nube nueva: el stack de capas se reconstruye al activar una herramienta
         self._layer_stack = None
 
@@ -550,7 +707,23 @@ class MainWindow(QMainWindow):
             dock.layer_activated.connect(self._on_layer_activated)
             dock.layer_removed.connect(self._on_layer_removed)
             dock.layer_restore_requested.connect(self._on_layer_restore)
+            dock.layer_renamed.connect(self._on_layer_renamed)
             dock.discards_removal_requested.connect(self._on_remove_discards)
+            dock.plano_params_changed.connect(self._on_plano_params)
+            dock.plano_capturar.connect(self._on_plano_capturar)
+            dock.plano_reajustar.connect(self._on_plano_reajustar)
+            dock.cilindro_params_changed.connect(self._on_cilindro_params)
+            dock.cilindro_capturar.connect(self._on_cilindro_capturar)
+            dock.cono_params_changed.connect(self._on_cono_params)
+            dock.cono_capturar.connect(self._on_cono_capturar)
+            dock.cono_reajustar.connect(self._on_cono_reajustar)
+            dock.dbscan_agrupar.connect(self._on_dbscan_agrupar)
+            dock.dbscan_eps_changed.connect(self._on_dbscan_eps)
+            dock.dbscan_umbral_changed.connect(self._on_dbscan_umbral)
+            dock.dbscan_seleccion_changed.connect(self._on_dbscan_seleccion)
+            dock.dbscan_capturar.connect(self._on_dbscan_capturar)
+            dock.dbscan_eliminar.connect(self._on_dbscan_eliminar)
+            dock.layers_merge_requested.connect(self._on_layers_merge)
             dock.export_requested.connect(self._on_export_visible)
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             self._crop_dock = dock
@@ -580,7 +753,7 @@ class MainWindow(QMainWindow):
 
     def _activate_tool(self, tool: str) -> None:
         if not self._ensure_layer_stack():
-            for act in (self._act_tool_caja, self._act_tool_lazo, self._act_tool_esfera):
+            for act in self._acts_tool:
                 act.setChecked(False)
             return
         self._deactivate_tools(keep_checked=tool)
@@ -606,6 +779,48 @@ class MainWindow(QMainWindow):
                 "Arrastra la esfera sobre la nube. Al soltar se ajusta y se "
                 "marca en VERDE lo que capturaría."
             )
+        elif tool == "plano":
+            self._plano = None
+            dock.set_plano_has_selection(False)
+            self._plano_pos = self.viewer.start_plane_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_plano_movido,
+            )
+            self.show_status(
+                "Coloca el plano sobre la superficie. Ajusta el RADIO: un plano "
+                "sin acotar captura todo lo coplanar de la nube."
+            )
+        elif tool == "cilindro":
+            self._cilindro = None
+            dock.set_cilindro_has_selection(False)
+            self.viewer.start_line_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_cilindro_movido,
+            )
+            self.show_status(
+                "Arrastra los extremos de la linea para dar el eje del cilindro. "
+                "Al soltar se ajusta el radio a los datos."
+            )
+        elif tool == "cono":
+            self._cono = None
+            dock.set_cono_has_selection(False)
+            self.viewer.start_line_widget(
+                self._layer_stack.active.pcd,
+                callback=self._on_cono_movido,
+            )
+            self.show_status(
+                "Arrastra la linea para dar el eje del cono. Al soltar se ajusta "
+                "la apertura a los datos."
+            )
+        elif tool == "dbscan":
+            self._db_etiquetas = None
+            self._db_seleccion = []
+            dock.refresh_clusters([])
+            self._mostrar_referencia_dbscan()
+            self.show_status(
+                "Ajusta eps y min_points, y pulsa 'Agrupar'. Es la operacion "
+                "cara, por eso no se dispara al mover los sliders."
+            )
         else:
             self.show_status(
                 "Elige la operacion y pulsa 'Iniciar lazo' en el panel Recorte."
@@ -617,19 +832,28 @@ class MainWindow(QMainWindow):
             act.setEnabled(True)
         self.viewer.stop_crop_widget()
         self.viewer.stop_sphere_widget()
+        self.viewer.stop_plane_widget()
+        self.viewer.stop_line_widget()
+        self.viewer.ocultar_fantasma_cono()
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         self._lasso_mask = None
         self._lasso_ops = []
         self._esfera = None
         self._esfera_mask = None
+        self._plano = self._plano_base = self._plano_mask = None
+        self._cilindro = self._cilindro_mask = None
+        self._cono = self._cono_base = self._cono_mask = None
+        self._db_etiquetas = self._db_etiquetas_filtradas = None
+        self._db_seleccion = []
+        self.viewer.ocultar_clusters()
         self._crop_min = None
         self._crop_max = None
         self._active_tool = None
         if self._crop_dock is not None:
             self._crop_dock.set_lasso_active(False)
             self._crop_dock.set_lasso_has_selection(False)
-        for act in (self._act_tool_caja, self._act_tool_lazo, self._act_tool_esfera):
+        for act in self._acts_tool:
             if act.data() != keep_checked:
                 act.setChecked(False)
 
@@ -702,6 +926,39 @@ class MainWindow(QMainWindow):
             f"'{recorte.name}' ({len(recorte.pcd.points):,} pts); "
             f"'{descarte.name}' ({len(descarte.pcd.points):,} pts) oculta."
         )
+
+    def _on_fps_toggled(self, activo: bool) -> None:
+        # mirar sin poder desplazarse no sirve de nada: van juntos
+        if activo and not self._act_wasd.isChecked():
+            self._act_wasd.setChecked(True)
+        self.viewer.set_mouse_look(bool(activo))
+        self.show_status(
+            "Vista libre activada: MANTÉN EL BOTÓN DERECHO y mueve el mouse para "
+            "mirar, W/A/S/D para desplazarte, E/Q para subir y bajar. Suelta el "
+            "botón derecho para volver a agarrar los manipuladores."
+            if activo else
+            "Vista libre desactivada. Arrastra para girar alrededor del objeto.")
+
+    def _on_wasd_toggled(self, activo: bool) -> None:
+        self.viewer.wasd_activo = bool(activo)
+        self.show_status(
+            "Navegación WASD activada: W/S adelante-atrás, A/D lateral, E/Q "
+            "subir-bajar (Shift = paso grande)."
+            if activo else "Navegación WASD desactivada."
+        )
+
+    def _on_layer_renamed(self, i: int, nombre: str) -> None:
+        """Renombrar es lo que convierte una capa en una entidad identificable:
+        'Recorte 3' no dice nada, 'Cúpula exterior' sí."""
+        if self._layer_stack is None:
+            return
+        try:
+            self._layer_stack.renombrar(i, nombre)
+        except (ValueError, IndexError) as e:
+            self.show_status(str(e))
+            return
+        self._ensure_crop_dock().refresh_layers(self._layer_stack)
+        self.show_status(f"Capa renombrada a '{nombre}'.")
 
     def _on_remove_discards(self) -> None:
         """Borra de una vez todo lo que quedó fuera de los recortes."""
@@ -891,7 +1148,8 @@ class MainWindow(QMainWindow):
             return
         pts = np.asarray(self._layer_stack.active.pcd.points)
         try:
-            self._esfera = ajustar_esfera(pts, centro, radio)
+            self._esfera = ajustar_esfera(pts, centro, radio,
+                                          eps=self._esfera_tol)
         except RuntimeError as e:
             self._esfera = None
             self._ensure_crop_dock().set_esfera_has_selection(False)
@@ -941,6 +1199,551 @@ class MainWindow(QMainWindow):
             self.viewer.start_sphere_widget(
                 self._layer_stack.active.pcd, callback=self._on_esfera_movida
             )
+
+    # ---------- herramienta plano (primitiva) ---------- #
+
+    def _on_plano_movido(self, punto, normal) -> None:
+        """El usuario soltó el plano: se ajusta a los datos y se previsualiza."""
+        from app.modules.primitivas import ajustar_plano
+
+        if self._layer_stack is None:
+            return
+        self._plano_pos = (np.asarray(punto, float), np.asarray(normal, float))
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        try:
+            self._plano_base = ajustar_plano(pts, punto, normal,
+                                             radio=self._plano_radio,
+                                             eps=self._plano_tol)
+        except RuntimeError as e:
+            self._plano = self._plano_base = None
+            self._ensure_crop_dock().set_plano_has_selection(False)
+            self.show_status(str(e))
+            return
+        # el desplazamiento se mide desde el ajuste nuevo, no desde el anterior
+        self._plano_offset = 0.0
+        self._ensure_crop_dock().reset_plano_offset()
+        self._rehacer_plano()
+        self.show_status("Plano ajustado a la superficie.")
+        self._repintar_plano()
+
+    def _on_plano_params(self, tol: float, radio: float, offset: float) -> None:
+        self._plano_tol = tol
+        self._plano_radio = radio
+        self._plano_offset = offset
+        # El radio decide QUÉ PUNTOS entran al ajuste, no solo cuáles se
+        # capturan; pero re-ajustar cuesta ~300 ms, así que solo se hace al
+        # soltar el slider (señal plano_reajustar) o si no hay plano todavía.
+        if self._plano_base is None and self._plano_pos is not None:
+            self._reajustar_plano()
+        self._rehacer_plano()
+        self._repintar_plano()
+
+    def _on_plano_reajustar(self) -> None:
+        """El usuario soltó el slider de radio: recién ahí se re-ajusta."""
+        self._reajustar_plano()
+        self._rehacer_plano()
+        self._repintar_plano()
+
+    def _reajustar_plano(self) -> None:
+        """Vuelve a ajustar con la última posición del widget y el radio actual."""
+        from app.modules.primitivas import ajustar_plano
+
+        if self._plano_pos is None or self._layer_stack is None:
+            return
+        punto, normal = self._plano_pos
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        try:
+            self._plano_base = ajustar_plano(pts, punto, normal,
+                                             radio=self._plano_radio,
+                                             eps=self._plano_tol)
+        except RuntimeError as e:
+            self._plano_base = None
+            self.show_status(str(e))
+
+    def _rehacer_plano(self) -> None:
+        """Reconstruye el plano con el radio y el desplazamiento actuales.
+
+        El radio y el offset son parte de la PRIMITIVA (definen dónde está y
+        hasta dónde llega), no de la máscara; por eso hay que rehacerla en vez
+        de solo recalcular qué puntos caen dentro. Se parte siempre del plano
+        ajustado (`_plano_base`), para que mover el slider de ida y vuelta
+        devuelva exactamente al mismo sitio en vez de ir acumulando error.
+        """
+        from app.modules.primitivas import Plano
+
+        if self._plano_base is None:
+            return
+        base = self._plano_base
+        self._plano = Plano(
+            normal=base.normal,
+            d=base.d - self._plano_offset,          # desplazar por la normal
+            centro=base.centro + self._plano_offset * base.normal,
+            radio=self._plano_radio,
+        )
+
+    def _repintar_plano(self) -> None:
+        from app.modules.primitivas import mascara_plano
+
+        if self._plano is None or self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        self._plano_mask = mascara_plano(pts, self._plano, self._plano_tol)
+        n = int(self._plano_mask.sum())
+        self._ensure_crop_dock().set_plano_has_selection(n > 0)
+        with self.viewer.camara_fija():
+            self.viewer.mostrar_disco_plano(
+                self._plano.centro, self._plano.normal, self._plano.radio)
+            self.viewer.preview_split(
+                self._layer_stack.active.pcd, self._plano_mask,
+                f"layer_{self._layer_stack.active_index}",
+            )
+        self.show_status(
+            f"Plano · tol {self._plano_tol:.2f} m · radio {self._plano_radio:.1f} m · "
+            f"desp {self._plano_offset:+.2f} m → {n:,} puntos capturados."
+        )
+
+    def _on_plano_capturar(self) -> None:
+        if self._plano_mask is None or not self._plano_mask.any():
+            self.show_status("No hay puntos capturados.")
+            return
+        self._apply_split(self._plano_mask)
+        self._plano = self._plano_base = self._plano_mask = None
+        self.viewer.ocultar_disco_plano()
+        self.viewer.clear_preview()
+        self._ensure_crop_dock().set_plano_has_selection(False)
+        if self._active_tool == "plano" and self._layer_stack is not None:
+            # sin ajuste inicial: repintar aquí haría parecer que la entidad
+            # recién capturada quedó a medias (parte verde, parte roja)
+            self._plano_pos = self.viewer.start_plane_widget(
+                self._layer_stack.active.pcd, callback=self._on_plano_movido,
+                ajustar_inicial=False,
+            )
+            self.show_status(
+                f"Entidad capturada en '{self._layer_stack.active.name}'. "
+                "Coloca el plano de nuevo para la siguiente."
+            )
+
+    # ---------- herramienta cilindro (primitiva) ---------- #
+
+    def _on_cilindro_movido(self, p1, normal_o_p2) -> None:
+        """El usuario soltó la línea del eje: se ajusta el radio a los datos.
+
+        El tramo de eje se toma de los extremos de la línea que puso el usuario:
+        es más directo que un slider aparte, y ya expresa dónde empieza y
+        termina el elemento.
+        """
+        from app.modules.primitivas import ajustar_cilindro
+
+        if self._layer_stack is None:
+            return
+        p1, p2 = np.asarray(p1, float), np.asarray(normal_o_p2, float)
+        eje = p2 - p1
+        largo = float(np.linalg.norm(eje))
+        if largo < 1e-6:
+            self.show_status("La línea del eje es demasiado corta.")
+            return
+        eje = eje / largo
+
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        r, h, _ = self._radio_aprox(pts, p1, eje, largo)
+        try:
+            self._cilindro = ajustar_cilindro(pts, p1, eje, radio_aprox=r,
+                                              h_min=0.0, h_max=largo,
+                                              eps=self._cilindro_tol)
+        except RuntimeError as e:
+            self._cilindro = None
+            self._ensure_crop_dock().set_cilindro_has_selection(False)
+            self.show_status(str(e))
+            return
+        self._cilindro_h = (0.0, largo)
+        self.show_status(f"Cilindro ajustado: radio {self._cilindro.radio:.3f} m.")
+        self._repintar_cilindro()
+
+    @staticmethod
+    def _radio_aprox(pts, punto, eje, largo) -> tuple[float, np.ndarray, np.ndarray]:
+        """Radio inicial para el ajuste: la mediana de la distancia al eje de los
+        puntos que caen dentro del tramo. Arranca cerca de la superficie real en
+        vez de un valor arbitrario que RANSAC tendría que salvar."""
+        rel = pts - punto
+        h = rel @ eje
+        radial = np.linalg.norm(rel - np.outer(h, eje), axis=1)
+        en_tramo = (h >= 0) & (h <= largo)
+        if not en_tramo.any():
+            return 1.0, radial, h
+        return float(np.median(radial[en_tramo])), radial, h
+
+    def _on_cilindro_params(self, tol: float, th_min: float, th_max: float) -> None:
+        self._cilindro_tol = tol
+        self._cilindro_theta = (th_min, th_max)
+        self._repintar_cilindro()
+
+    def _repintar_cilindro(self) -> None:
+        from app.modules.primitivas import mascara_cilindro
+
+        if self._cilindro is None or self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        h_min, h_max = self._cilindro_h
+        th_min, th_max = self._cilindro_theta
+        self._cilindro_mask = mascara_cilindro(
+            pts, self._cilindro, self._cilindro_tol, h_min, h_max, th_min, th_max
+        )
+        n = int(self._cilindro_mask.sum())
+        self._ensure_crop_dock().set_cilindro_has_selection(n > 0)
+        with self.viewer.camara_fija():
+            self.viewer.mostrar_fantasma_cilindro(
+                self._cilindro.punto, self._cilindro.eje, self._cilindro.radio,
+                h_min, h_max)
+            self.viewer.preview_split(
+                self._layer_stack.active.pcd, self._cilindro_mask,
+                f"layer_{self._layer_stack.active_index}",
+            )
+        self.show_status(
+            f"Cilindro r={self._cilindro.radio:.3f} m · tol {self._cilindro_tol:.2f} m · "
+            f"θ [{th_min:.0f}, {th_max:.0f}] → {n:,} puntos capturados."
+        )
+
+    def _on_cilindro_capturar(self) -> None:
+        if self._cilindro_mask is None or not self._cilindro_mask.any():
+            self.show_status("No hay puntos capturados.")
+            return
+        self._apply_split(self._cilindro_mask)
+        self._cilindro = self._cilindro_mask = None
+        self.viewer.ocultar_fantasma_cilindro()
+        self.viewer.clear_preview()
+        self._ensure_crop_dock().set_cilindro_has_selection(False)
+        if self._active_tool == "cilindro" and self._layer_stack is not None:
+            self.viewer.start_line_widget(
+                self._layer_stack.active.pcd, callback=self._on_cilindro_movido
+            )
+
+    # ---------- herramienta cono (primitiva) ---------- #
+
+    def _on_cono_movido(self, p1, p2) -> None:
+        """El usuario soltó la línea del eje: se ajusta la apertura a los datos."""
+        from app.modules.primitivas import ajustar_cono
+
+        if self._layer_stack is None:
+            return
+        p1, p2 = np.asarray(p1, float), np.asarray(p2, float)
+        eje = p2 - p1
+        largo = float(np.linalg.norm(eje))
+        if largo < 1e-6:
+            self.show_status("La línea del eje es demasiado corta.")
+            return
+        eje = eje / largo
+
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        r, _, _ = self._radio_aprox(pts, p1, eje, largo)
+        try:
+            self._cono_base = ajustar_cono(pts, p1, eje, radio_aprox=r,
+                                           h_min=0.0, h_max=largo,
+                                           eps=self._cono_tol)
+        except RuntimeError as e:
+            self._cono = self._cono_base = None
+            self._ensure_crop_dock().set_cono_has_selection(False)
+            self.show_status(str(e))
+            return
+        self._cono_h = (0.0, largo)
+        self._volver_a_la_apertura_ajustada()
+        self._repintar_cono()
+
+    def _volver_a_la_apertura_ajustada(self) -> None:
+        """El slider pasa a mostrar la apertura que encontró RANSAC, que es
+        desde donde el usuario va a corregir."""
+        if self._cono_base is None:
+            return
+        signo = float(np.degrees(np.arctan(self._cono_base.pendiente)))
+        self._cono_apertura = signo
+        self._cono = self._cono_base
+        self._ensure_crop_dock().set_cono_apertura(signo)
+
+    def _on_cono_reajustar(self) -> None:
+        self._volver_a_la_apertura_ajustada()
+        self._repintar_cono()
+
+    def _on_cono_params(self, tol: float, th_min: float, th_max: float,
+                        apertura: float) -> None:
+        from app.modules.primitivas import con_apertura
+        self._cono_tol = tol
+        self._cono_theta = (th_min, th_max)
+        if self._cono_base is not None and apertura != self._cono_apertura:
+            self._cono_apertura = apertura
+            self._cono = con_apertura(self._cono_base, apertura, *self._cono_h)
+        self._repintar_cono()
+
+    def _repintar_cono(self) -> None:
+        from app.modules.primitivas import mascara_cono
+
+        if self._cono is None or self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        h_min, h_max = self._cono_h
+        th_min, th_max = self._cono_theta
+        self._cono_mask = mascara_cono(pts, self._cono, self._cono_tol,
+                                       h_min, h_max, th_min, th_max)
+        n = int(self._cono_mask.sum())
+        dock = self._ensure_crop_dock()
+        dock.set_cono_has_selection(n > 0)
+        # un cono de pendiente ~0 es en realidad un cilindro: conviene decirlo en
+        # vez de dejar que el usuario lo descubra por su cuenta
+        dock.set_cono_info(
+            f"Semiángulo {self._cono.semiangulo:.1f}° · "
+            + ("sin apertura: es un cilindro" if self._cono.vertice() is None
+               else f"radio {float(self._cono.radio_en(h_min)):.2f} → "
+                    f"{float(self._cono.radio_en(h_max)):.2f} m")
+        )
+        with self.viewer.camara_fija():
+            self.viewer.mostrar_fantasma_cono(
+                self._cono.punto, self._cono.eje,
+                float(self._cono.radio_en(h_min)),
+                float(self._cono.radio_en(h_max)), h_min, h_max)
+            self.viewer.preview_split(
+                self._layer_stack.active.pcd, self._cono_mask,
+                f"layer_{self._layer_stack.active_index}",
+            )
+        self.show_status(
+            f"Cono · semiángulo {self._cono.semiangulo:.1f}° · "
+            f"tol {self._cono_tol:.2f} m · θ [{th_min:.0f}, {th_max:.0f}] → "
+            f"{n:,} puntos capturados."
+        )
+
+    def _on_cono_capturar(self) -> None:
+        if self._cono_mask is None or not self._cono_mask.any():
+            self.show_status("No hay puntos capturados.")
+            return
+        self._apply_split(self._cono_mask)
+        self._cono = self._cono_base = self._cono_mask = None
+        self.viewer.ocultar_fantasma_cono()
+        self.viewer.clear_preview()
+        self._ensure_crop_dock().set_cono_has_selection(False)
+        if self._active_tool == "cono" and self._layer_stack is not None:
+            self.viewer.start_line_widget(
+                self._layer_stack.active.pcd, callback=self._on_cono_movido
+            )
+
+    # ---------- herramienta DBSCAN ---------- #
+
+    def _mostrar_referencia_dbscan(self) -> None:
+        """Muestra el espaciado de la nube: es la referencia para elegir eps.
+
+        Sin este dato el usuario ajusta a ciegas, y eps es el parámetro que
+        decide si todo queda en un solo cluster o si todo queda como ruido.
+        """
+        from app.modules.clusters import MAX_PUNTOS_DBSCAN, espaciado_efectivo
+
+        if self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        if len(pts) < 2:
+            return
+        # el espaciado se mide sobre la submuestra que DBSCAN va a ver, no
+        # sobre la nube completa: si no, el eps sugerido queda muy por debajo
+        e = espaciado_efectivo(pts)
+        nota = ("" if len(pts) <= MAX_PUNTOS_DBSCAN
+                else f" (se agrupan {MAX_PUNTOS_DBSCAN:,} y se propaga al resto)")
+        dock = self._ensure_crop_dock()
+        dock.set_dbscan_referencia(
+            f"{len(pts):,} puntos{nota} · espaciado {e:.3f} m. "
+            f"Un eps entre {2*e:.2f} y {5*e:.2f} m suele funcionar."
+        )
+        self._db_espaciado = e
+        from app.modules.clusters import EPS_POR_ESPACIADO
+        dock.set_dbscan_eps(EPS_POR_ESPACIADO * e)
+
+    def _on_dbscan_eps(self, eps: float) -> None:
+        """Con cada eps cambia cuántos vecinos tiene un punto, y ese número es
+        el techo de min_points: por encima, ningún punto llega a ser núcleo y
+        todo queda como ruido."""
+        from app.modules.clusters import MAX_PUNTOS_DBSCAN, vecinos_tipicos
+
+        if self._layer_stack is None or getattr(self, "_db_espaciado", 0) <= 0:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        if len(pts) > MAX_PUNTOS_DBSCAN:
+            idx = np.random.default_rng(0).choice(len(pts), MAX_PUNTOS_DBSCAN,
+                                                  replace=False)
+            pts = pts[idx]
+        from app.modules.clusters import MIN_POINTS_POR_VECINOS
+        v = vecinos_tipicos(pts, eps)
+        sugerido = max(3, int(round(v * MIN_POINTS_POR_VECINOS)))
+        self._ensure_crop_dock().set_dbscan_referencia(
+            f"{len(pts):,} puntos agrupables · espaciado {self._db_espaciado:.3f} m.\n"
+            f"Con este eps un punto tiene ~{v} vecinos → min_points {sugerido} "
+            f"(la proporción de la corrida buena del interior).\n"
+            f"OJO: DBSCAN separa lo que está DESCONECTADO. Sobre la estructura "
+            f"completa dará un solo cluster; úsalo después de quitar la cúpula, "
+            f"el tambor y el suelo con las primitivas."
+        )
+
+    def _on_dbscan_agrupar(self, eps: float, min_points: int) -> None:
+        if self._layer_stack is None:
+            return
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        self.show_status(f"Agrupando {len(pts):,} puntos (eps={eps:.2f}, "
+                         f"min_points={min_points})...")
+        self._set_loading(True)
+
+        from app.core.workers import DbscanWorker
+        worker = DbscanWorker(pts, eps, min_points, parent=self)
+        worker.finished.connect(self._on_dbscan_listo)
+        worker.error.connect(self._on_load_error)
+        self._current_worker = worker
+        worker.start()
+
+    def _on_dbscan_listo(self, etiquetas) -> None:
+        self._set_loading(False)
+        self._db_etiquetas = etiquetas
+        self._db_seleccion = []
+        self._refrescar_clusters()
+
+    def _on_dbscan_umbral(self, minimo: int) -> None:
+        self._db_umbral = int(minimo)
+        # el umbral se aplica sobre las etiquetas ya calculadas: no se repite
+        # DBSCAN, que es lo caro
+        self._refrescar_clusters()
+
+    def _refrescar_clusters(self) -> None:
+        from app.modules.clusters import info_clusters, marcar_pequenos_como_ruido
+
+        if self._db_etiquetas is None or self._layer_stack is None:
+            return
+        et = self._db_etiquetas
+        if self._db_umbral > 0:
+            et = marcar_pequenos_como_ruido(et, self._db_umbral)
+        self._db_etiquetas_filtradas = et
+
+        pts = np.asarray(self._layer_stack.active.pcd.points)
+        infos = info_clusters(pts, et)
+        dock = self._ensure_crop_dock()
+        dock.refresh_clusters(infos)
+        self._db_seleccion = []
+        self._pintar_clusters()
+        n_ruido = int((et == -1).sum())
+        self.show_status(
+            f"{len(infos)} clusters · {n_ruido:,} puntos como ruido. "
+            "Marca los que quieras y usa Capturar o Eliminar."
+        )
+
+    def _pintar_clusters(self) -> None:
+        if self._db_etiquetas_filtradas is None or self._layer_stack is None:
+            return
+        with self.viewer.camara_fija():
+            self.viewer.mostrar_clusters(
+                self._layer_stack.active.pcd, self._db_etiquetas_filtradas,
+                self._db_seleccion, f"layer_{self._layer_stack.active_index}",
+            )
+
+    def _on_dbscan_seleccion(self, ids) -> None:
+        self._db_seleccion = [int(i) for i in ids]
+        self._pintar_clusters()
+        if self._db_etiquetas_filtradas is not None:
+            from app.modules.clusters import mascara_de
+            n = int(mascara_de(self._db_etiquetas_filtradas, self._db_seleccion).sum())
+            self.show_status(f"{len(self._db_seleccion)} clusters marcados · "
+                             f"{n:,} puntos.")
+
+    def _mascara_seleccion_dbscan(self):
+        from app.modules.clusters import mascara_de
+        if self._db_etiquetas_filtradas is None or not self._db_seleccion:
+            return None
+        return mascara_de(self._db_etiquetas_filtradas, self._db_seleccion)
+
+    def _on_dbscan_capturar(self) -> None:
+        """Cada cluster marcado pasa a ser su propia capa.
+
+        Por separado y no fusionados: un cluster es una unidad que el usuario
+        puede juzgar, y siempre puede unir varias capas después. Al revés no:
+        una capa fusionada ya no se puede volver a separar.
+        """
+        from app.core.layers import CloudLayer, _subset
+        from app.modules.clusters import mascara_de
+
+        if self._layer_stack is None or not self._db_seleccion:
+            return
+        stack = self._layer_stack
+        fuente = stack.active
+        et = self._db_etiquetas_filtradas
+        usados = mascara_de(et, self._db_seleccion)
+        if not usados.any():
+            self.show_status("Los clusters marcados no tienen puntos.")
+            return
+
+        nuevas = []
+        for cid in self._db_seleccion:
+            m = et == cid
+            if m.any():
+                nuevas.append(CloudLayer(name=f"Cluster {cid}",
+                                         pcd=_subset(fuente.pcd, m)))
+        resto = _subset(fuente.pcd, ~usados)
+        if len(resto.points):
+            fuente.pcd = resto
+        else:
+            stack.layers.remove(fuente)
+
+        i = stack.layers.index(fuente) + 1 if fuente in stack.layers else 0
+        stack.layers[i:i] = nuevas
+        stack.active_index = i
+
+        self._db_etiquetas = self._db_etiquetas_filtradas = None
+        self._db_seleccion = []
+        self.viewer.ocultar_clusters()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.refresh_clusters([])
+        self._mostrar_referencia_dbscan()
+        self.show_status(
+            f"{len(nuevas)} clusters capturados como capas. Renombralos con "
+            "doble clic, o marca varios y usa 'Unir seleccionadas'."
+        )
+
+    def _on_dbscan_eliminar(self) -> None:
+        """Quita de la capa los clusters marcados. La otra mitad de la feature:
+        limpiar ruido y objetos que no son estructura."""
+        from app.core.layers import _subset
+
+        mask = self._mascara_seleccion_dbscan()
+        if mask is None or not mask.any() or self._layer_stack is None:
+            return
+        if mask.all():
+            self.show_status("Eso eliminaria la capa entera.")
+            return
+        stack = self._layer_stack
+        n = int(mask.sum())
+        stack.active.pcd = _subset(stack.active.pcd, ~mask)
+
+        self._db_etiquetas = self._db_etiquetas_filtradas = None
+        self._db_seleccion = []
+        self.viewer.ocultar_clusters()
+        self.viewer.show_layers(stack)
+        dock = self._ensure_crop_dock()
+        dock.refresh_layers(stack)
+        dock.refresh_clusters([])
+        self._mostrar_referencia_dbscan()
+        self.show_status(f"{n:,} puntos eliminados. Vuelve a agrupar si quieres "
+                         "seguir limpiando.")
+
+    def _on_layers_merge(self, indices) -> None:
+        """Une varias capas en una entidad."""
+        if self._layer_stack is None or len(indices) < 2:
+            return
+        sugerido = self._layer_stack.layers[indices[0]].name
+        nombre, ok = QInputDialog.getText(
+            self, "Unir capas",
+            f"Se unirán {len(indices)} capas en una.\n\nNombre de la entidad:",
+            text=sugerido)
+        if not ok:
+            return
+        try:
+            capa = self._layer_stack.unir(indices, nombre)
+        except (ValueError, IndexError) as e:
+            QMessageBox.warning(self, "Unir capas", str(e))
+            return
+        self.viewer.show_layers(self._layer_stack)
+        self._ensure_crop_dock().refresh_layers(self._layer_stack)
+        self.show_status(f"{len(indices)} capas unidas en "
+                         f"'{capa.name}' ({len(capa.pcd.points):,} pts).")
 
     # ---------- herramienta lazo ---------- #
 

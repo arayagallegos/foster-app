@@ -17,7 +17,21 @@ from pyvistaqt import QtInteractor
 from PyQt6.QtWidgets import QWidget, QVBoxLayout
 from contextlib import contextmanager
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, pyqtSignal
+from PyQt6.QtGui import QCursor
+
+
+def _base_perpendicular(eje: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Dos vectores unitarios perpendiculares al eje. Misma convención que
+    `Cilindro.base()` del motor, para que el ángulo 0 coincida en ambos."""
+    eje = np.asarray(eje, float)
+    eje = eje / np.linalg.norm(eje)
+    ref = np.array([1.0, 0.0, 0.0])
+    if abs(float(eje @ ref)) > 0.9:
+        ref = np.array([0.0, 1.0, 0.0])
+    u = ref - (ref @ eje) * eje
+    u = u / np.linalg.norm(u)
+    return u, np.cross(eje, u)
 
 
 # Límite de puntos para visualización interactiva fluida
@@ -44,11 +58,20 @@ class Viewer3D(QWidget):
         self._active_actors: list[str] = []  # nombres de actors en la escena
         self._crop_widget = None
         self._sphere_widget = None
+        self._plane_widget = None
+        self._line_widget = None
         # Centro compartido de la escena: todos los actores (capas, previews)
         # se dibujan restando este centro para quedar alineados.
         self._scene_center: np.ndarray | None = None
         self._dimmed_actor: list[str] | None = None   # actores atenuados por el preview
         self._camara_encuadrada = False   # se encuadra una vez, al cargar
+        # apagada por defecto: la órbita es lo que se espera al abrir un visor
+        self.wasd_activo = False
+        self._look_habilitado = False   # mirar con botón derecho
+        self._mirando = False           # botón derecho apretado ahora
+        self._cursor_origen = None
+        self._opacidad_nube = 1.0
+        self._tamano_punto = 2.0
         # Estado del lazo (VTK-based)
         self._lasso_callback = None
         self._lasso_obs_ids: list[int] = []
@@ -68,6 +91,7 @@ class Viewer3D(QWidget):
         self.plotter.show_axes()
 
         layout.addWidget(self.plotter.interactor)
+        self._instalar_wasd()
 
     # ------------------------------------------------------------------ #
     # Carga de nubes de puntos                                             #
@@ -176,6 +200,209 @@ class Viewer3D(QWidget):
     # ------------------------------------------------------------------ #
     # Control de la escena                                                 #
     # ------------------------------------------------------------------ #
+
+    # ------------------------------------------------------------------ #
+    # Navegación WASD                                                     #
+    # ------------------------------------------------------------------ #
+
+    # (tecla, adelante, lateral, vertical). Mayúscula = paso grande, porque VTK
+    # entrega la tecla ya en mayúscula cuando se pulsa con Shift.
+    _TECLAS_WASD = (
+        ("w", 1.0, 0.0, 0.0), ("s", -1.0, 0.0, 0.0),
+        ("d", 0.0, 1.0, 0.0), ("a", 0.0, -1.0, 0.0),
+        ("e", 0.0, 0.0, 1.0), ("q", 0.0, 0.0, -1.0),
+    )
+    PASO_WASD = 0.08          # fracción de la distancia al foco, por pulsación
+
+    def _instalar_wasd(self) -> None:
+        """Registra las teclas de navegación.
+
+        Hay que registrarlas sí o sí: VTK ya usa w/s para wireframe/superficie y
+        q/e para CERRAR la ventana. Sin sobrescribirlas, pulsar 'q' mataría el
+        visor. El interruptor `wasd_activo` decide si además mueven la cámara.
+        """
+        for tecla, ade, lat, ver in self._TECLAS_WASD:
+            for k, factor in ((tecla, 1.0), (tecla.upper(), 4.0)):
+                self.plotter.add_key_event(
+                    k, lambda a=ade, l=lat, v=ver, f=factor:
+                        self._mover_camara(a * f, l * f, v * f)
+                )
+
+    ACTORES_PREVIEW = ("_preview_keep", "_preview_discard",
+                       "_lasso_selection", "_clusters")
+
+    def set_opacidad_nube(self, opacidad: float) -> None:
+        """Transparencia de la nube: permite ver los manipuladores de una
+        primitiva cuando quedan DENTRO de la estructura."""
+        self._opacidad_nube = float(np.clip(opacidad, 0.05, 1.0))
+        self._aplicar_estilo_nube()
+
+    def set_tamano_punto(self, tam: float) -> None:
+        """Tamaño del punto en píxeles. Puntos chicos dejan huecos entre sí y
+        hacen visible la geometría de detrás."""
+        self._tamano_punto = float(np.clip(tam, 1.0, 10.0))
+        self._aplicar_estilo_nube()
+
+    def _aplicar_estilo_nube(self, render: bool = True) -> None:
+        """Reaplica opacidad y tamaño de punto a TODOS los actores de nube.
+
+        Incluye los del preview (verde/rojo). Esto importa justo cuando más:
+        durante un recorte es cuando hace falta ver a través de la nube, y si
+        el preview se dibujara con valores fijos, bajar la opacidad no serviría
+        de nada. Es también la razón de tener una sola función en vez de fijar
+        los valores en cada `add_mesh`: así no hay dos verdades que se pisen.
+
+        No redibuja geometría, solo toca propiedades del actor: es instantáneo
+        aunque la nube tenga millones de puntos.
+        """
+        atenuados = set(self._dimmed_actor or ())
+        for nombre in list(self._active_actors) + list(self.ACTORES_PREVIEW):
+            actor = self.plotter.actors.get(nombre)
+            if actor is None:
+                continue
+            prop = actor.GetProperty()
+            prop.SetPointSize(self._tamano_punto)
+            if nombre in atenuados:
+                # capa fuente bajo un preview: se atenúa MUCHO, pero relativo a
+                # lo que pidió el usuario, no a un valor absoluto
+                prop.SetOpacity(self._opacidad_nube * 0.15)
+            else:
+                prop.SetOpacity(self._opacidad_nube)
+        if render:
+            self.plotter.render()
+
+    SENS_MOUSE = 0.0035        # radianes por píxel de movimiento
+
+    def set_mouse_look(self, activo: bool) -> None:
+        """Habilita mirar en primera persona MIENTRAS se mantiene el botón derecho.
+
+        Sin modos: apretado miras y vuelas con WASD; al soltar recuperas el
+        cursor para agarrar los manipuladores de la primitiva. Es lo que hacen
+        Blender, el editor de Unreal y CloudCompare, y evita el vaivén de entrar
+        y salir de un modo cada vez que hay que ajustar algo — que es
+        precisamente lo que más se hace en esta herramienta.
+
+        Mientras está apretado el cursor se oculta y se recentra en cada
+        movimiento, para poder girar sin que el ratón tope con el borde de la
+        pantalla; al soltar vuelve a donde estaba.
+        """
+        activo = bool(activo)
+        if activo == self._look_habilitado:
+            return
+        self._look_habilitado = activo
+        w = self.plotter.interactor
+        if activo:
+            w.installEventFilter(self)
+        else:
+            self._terminar_look()
+            w.removeEventFilter(self)
+
+    def _centro_global(self):
+        w = self.plotter.interactor
+        return w.mapToGlobal(w.rect().center())
+
+    def _iniciar_look(self) -> None:
+        self._mirando = True
+        self._cursor_origen = QCursor.pos()   # para devolverlo al soltar
+        self.plotter.interactor.setCursor(Qt.CursorShape.BlankCursor)
+        QCursor.setPos(self._centro_global())
+
+    def _terminar_look(self) -> None:
+        if not self._mirando:
+            return
+        self._mirando = False
+        self.plotter.interactor.unsetCursor()
+        if self._cursor_origen is not None:
+            QCursor.setPos(self._cursor_origen)
+            self._cursor_origen = None
+
+    def eventFilter(self, obj, ev):
+        if not self._look_habilitado:
+            return super().eventFilter(obj, ev)
+        tipo = ev.type()
+        if tipo == QEvent.Type.MouseButtonPress and                 ev.button() == Qt.MouseButton.RightButton:
+            self._iniciar_look()
+            return True          # VTK usa el botón derecho para zoom: se anula
+        if tipo == QEvent.Type.MouseButtonRelease and                 ev.button() == Qt.MouseButton.RightButton:
+            self._terminar_look()
+            return True
+        if tipo == QEvent.Type.MouseMove and self._mirando:
+            centro = self._centro_global()
+            p = ev.globalPosition().toPoint()
+            dx, dy = p.x() - centro.x(), p.y() - centro.y()
+            if dx or dy:
+                self._girar_camara(dx, dy)
+                QCursor.setPos(centro)   # el recentrado da delta cero: no gira
+            return True
+        return super().eventFilter(obj, ev)
+
+    def _girar_camara(self, dx: int, dy: int) -> None:
+        """Gira la mirada sobre la posición de la cámara (yaw + pitch).
+
+        A diferencia de la órbita, la cámara NO se mueve: se queda donde está y
+        gira la cabeza. El giro horizontal es siempre alrededor del eje Z del
+        mundo, para que la vertical del observatorio siga siendo la vertical de
+        la pantalla; y el vertical se limita antes del cenit, porque justo ahí
+        la dirección y el "arriba" se vuelven paralelos y la imagen daría un
+        tirón.
+        """
+        cam = self.plotter.camera
+        pos = np.array(cam.position, float)
+        d = np.array(cam.focal_point, float) - pos
+        dist = float(np.linalg.norm(d))
+        if dist < 1e-9:
+            return
+        v = d / dist
+
+        yaw = -dx * self.SENS_MOUSE
+        cy, sy = np.cos(yaw), np.sin(yaw)
+        v = np.array([v[0] * cy - v[1] * sy, v[0] * sy + v[1] * cy, v[2]])
+
+        derecha = np.cross(v, (0.0, 0.0, 1.0))
+        n = float(np.linalg.norm(derecha))
+        if n > 1e-9:
+            derecha /= n
+            pitch = -dy * self.SENS_MOUSE
+            cp, sp = np.cos(pitch), np.sin(pitch)
+            # rotación de Rodrigues de v alrededor de `derecha`
+            v = v * cp + np.cross(derecha, v) * sp + derecha * (derecha @ v) * (1 - cp)
+            v /= np.linalg.norm(v)
+            if abs(v[2]) > 0.995:      # casi vertical: se frena antes del tirón
+                return
+
+        cam.focal_point = pos + v * dist
+        cam.up = (0.0, 0.0, 1.0)
+        self.plotter.render()
+
+    def _mover_camara(self, adelante: float, lateral: float, vertical: float) -> None:
+        """Desplaza cámara y foco juntos, en el sistema de la propia cámara.
+
+        El paso es proporcional a la distancia al foco: lejos avanza a zancadas
+        y cerca de la superficie se mueve fino, que es justo cuando hace falta
+        precisión para colocar una primitiva.
+        """
+        if not self.wasd_activo:
+            return
+        cam = self.plotter.camera
+        pos, foco = np.array(cam.position, float), np.array(cam.focal_point, float)
+        arriba = np.array(cam.up, float)
+        vista = foco - pos
+        dist = float(np.linalg.norm(vista))
+        if dist < 1e-9:
+            return
+        vista /= dist
+        derecha = np.cross(vista, arriba)
+        n = np.linalg.norm(derecha)
+        if n < 1e-9:
+            return
+        derecha /= n
+        arriba = np.cross(derecha, vista)      # re-ortogonaliza
+
+        paso = dist * self.PASO_WASD
+        d = (vista * adelante + derecha * lateral + arriba * vertical) * paso
+        cam.position = pos + d
+        cam.focal_point = foco + d
+        self.plotter.render()
 
     @contextmanager
     def camara_fija(self):
@@ -356,6 +583,182 @@ class Viewer3D(QWidget):
                 pass
             self._sphere_widget = None
         self.plotter.render()
+
+    def start_plane_widget(self, pcd: o3d.geometry.PointCloud, callback,
+                           ajustar_inicial: bool = True):
+        """
+        Activa un plano interactivo (origen + normal arrastrables).
+
+        Args:
+            pcd:      Nube sobre la que se segmenta.
+            callback: Función (punto: np.ndarray, normal: np.ndarray) -> None,
+                      con el punto en coordenadas mundo.
+        """
+        if self._plane_widget is not None:
+            self.stop_plane_widget()
+
+        pts = np.asarray(pcd.points)
+        center = self._scene_center if self._scene_center is not None else pts.mean(axis=0)
+        pts_c = pts - center
+
+        def _pv_callback(normal, origen):
+            callback(np.asarray(origen) + center, np.asarray(normal))
+
+        origen0 = pts_c.mean(axis=0)
+        self._plane_widget = self.plotter.add_plane_widget(
+            _pv_callback,
+            origin=origen0,
+            normal=(0.0, 0.0, 1.0),
+            bounds=self._bounds_de(pts_c),
+            color="#4fc3f7",
+            outline_translation=False,   # el plano se mueve, su caja no
+            implicit=False,              # plano finito: se ve dónde va a capturar
+            interaction_event="end",
+        )
+        # El callback de VTK solo se dispara al SOLTAR. Con `ajustar_inicial` se
+        # fuerza un primer ajuste para que los sliders tengan sobre qué operar;
+        # se omite al reiniciar tras una captura, porque ahí repintar de
+        # inmediato haría parecer que la entidad recién capturada quedó a medias.
+        if ajustar_inicial:
+            _pv_callback((0.0, 0.0, 1.0), origen0)
+        return np.asarray(origen0) + center, np.array([0.0, 0.0, 1.0])
+
+    def mostrar_disco_plano(self, centro, normal, radio: float) -> None:
+        """Dibuja el disco que el plano REALMENTE captura.
+
+        El cuadrado del widget de VTK no tiene relación con el radio de captura:
+        sin este disco el usuario ve una superficie enorme y captura una mucho
+        más chica, sin manera de saberlo.
+        """
+        c = self._scene_center if self._scene_center is not None else 0.0
+        disco = pv.Disc(center=np.asarray(centro) - c, inner=0.0, outer=float(radio),
+                        normal=np.asarray(normal), r_res=1, c_res=64)
+        self.plotter.add_mesh(disco, color="#ffd54f", opacity=0.25,
+                              name="_plano_disco", reset_camera=False)
+        self.plotter.render()
+
+    def ocultar_disco_plano(self) -> None:
+        if "_plano_disco" in self.plotter.actors:
+            self.plotter.remove_actor("_plano_disco")
+            self.plotter.render()
+
+    def stop_plane_widget(self) -> None:
+        self.ocultar_disco_plano()
+        if self._plane_widget is not None:
+            try:
+                self._plane_widget.Off()
+            except Exception:
+                pass
+            self._plane_widget = None
+        self.plotter.render()
+
+    def start_line_widget(self, pcd: o3d.geometry.PointCloud, callback) -> None:
+        """
+        Activa una línea interactiva, que define el EJE del cilindro.
+
+        PyVista no trae un widget de cilindro; la línea es la forma natural de
+        dar un eje, y el radio se ajusta después a los datos con RANSAC.
+
+        Args:
+            callback: Función (p1: np.ndarray, p2: np.ndarray) -> None, en
+                      coordenadas mundo.
+        """
+        if self._line_widget is not None:
+            self.stop_line_widget()
+
+        pts = np.asarray(pcd.points)
+        center = self._scene_center if self._scene_center is not None else pts.mean(axis=0)
+        pts_c = pts - center
+
+        def _pv_callback(linea):
+            p1 = np.asarray(linea.points[0]) + center
+            p2 = np.asarray(linea.points[-1]) + center
+            callback(p1, p2)
+
+        self._line_widget = self.plotter.add_line_widget(
+            _pv_callback,
+            bounds=self._bounds_de(pts_c),
+            color="#4fc3f7",
+            interaction_event="end",
+        )
+
+    def mostrar_fantasma_cilindro(self, punto, eje, radio: float,
+                                  h_min: float, h_max: float) -> None:
+        """Dibuja el cilindro ajustado.
+
+        El widget de VTK solo muestra una línea con dos esferas: el usuario tiene
+        que imaginarse la superficie que va a capturar. Ver la figura de verdad
+        es la diferencia entre colocarla a ojo y colocarla con criterio.
+        """
+        c = self._scene_center if self._scene_center is not None else 0.0
+        punto, eje = np.asarray(punto, float), np.asarray(eje, float)
+        altura = float(h_max - h_min)
+        if not np.isfinite(altura) or altura <= 0:
+            return
+        centro = punto + eje * (h_min + altura / 2.0) - c
+        cil = pv.Cylinder(center=centro, direction=eje, radius=float(radio),
+                          height=altura, resolution=64, capping=False)
+        self.plotter.add_mesh(cil, color="#ffd54f", opacity=0.20,
+                              name="_cilindro_fantasma", reset_camera=False)
+        self.plotter.render()
+
+    def mostrar_fantasma_cono(self, punto, eje, r_min: float, r_max: float,
+                              h_min: float, h_max: float, n: int = 64) -> None:
+        """Dibuja el tronco de cono ajustado.
+
+        Se construye a mano y no con `pv.Cone` porque este dibuja el cono
+        completo desde el vértice, que puede quedar decenas de metros fuera de
+        la nube; lo que interesa ver es el tramo que realmente captura.
+        """
+        c = self._scene_center if self._scene_center is not None else 0.0
+        punto, eje = np.asarray(punto, float), np.asarray(eje, float)
+        if not np.isfinite([r_min, r_max, h_min, h_max]).all() or h_max <= h_min:
+            return
+        u, v = _base_perpendicular(eje)
+        th = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        aro = np.cos(th)[:, None] * u + np.sin(th)[:, None] * v
+        abajo = punto + eje * h_min + max(r_min, 0.0) * aro - c
+        arriba = punto + eje * h_max + max(r_max, 0.0) * aro - c
+
+        pts = np.vstack([abajo, arriba])
+        caras = []
+        for i in range(n):
+            j = (i + 1) % n
+            caras += [4, i, j, n + j, n + i]
+        malla = pv.PolyData(pts, faces=np.array(caras))
+        self.plotter.add_mesh(malla, color="#ffd54f", opacity=0.20,
+                              name="_cono_fantasma", reset_camera=False)
+        self.plotter.render()
+
+    def ocultar_fantasma_cono(self) -> None:
+        if "_cono_fantasma" in self.plotter.actors:
+            self.plotter.remove_actor("_cono_fantasma")
+            self.plotter.render()
+
+    def ocultar_fantasma_cilindro(self) -> None:
+        if "_cilindro_fantasma" in self.plotter.actors:
+            self.plotter.remove_actor("_cilindro_fantasma")
+            self.plotter.render()
+
+    def stop_line_widget(self) -> None:
+        self.ocultar_fantasma_cilindro()
+        if self._line_widget is not None:
+            try:
+                self._line_widget.Off()
+            except Exception:
+                pass
+            self._line_widget = None
+        self.plotter.render()
+
+    @staticmethod
+    def _bounds_de(pts_c: np.ndarray) -> list[float]:
+        """Bounds en el formato de PyVista, acotados al 50 % de la nube para que
+        el widget arranque a una escala manejable en vez de abarcar el cerro."""
+        mn, mx = pts_c.min(axis=0), pts_c.max(axis=0)
+        c, half = (mn + mx) / 2, (mx - mn) * 0.25
+        return [c[0] - half[0], c[0] + half[0],
+                c[1] - half[1], c[1] + half[1],
+                c[2] - half[2], c[2] + half[2]]
 
     # ------------------------------------------------------------------ #
     # Herramienta de lazo (VTK observer + vtkActor2D)                     #
@@ -603,7 +1006,6 @@ class Viewer3D(QWidget):
         for nombre in nombres:
             actor = self.plotter.actors.get(nombre)
             if actor is not None:
-                actor.GetProperty().SetOpacity(0.15)
                 self._dimmed_actor.append(nombre)
 
         for name, sel in (("_preview_keep", keep_mask), ("_preview_discard", ~keep_mask)):
@@ -611,20 +1013,64 @@ class Viewer3D(QWidget):
                 self.plotter.remove_actor(name)
             if sel.any():
                 color = self.COLOR_KEEP if name == "_preview_keep" else self.COLOR_DISCARD
-                self._add_points_actor(pts[sel], name, color, point_size=4.0)
-        self.plotter.render()
+                self._add_points_actor(pts[sel], name, color,
+                                       point_size=self._tamano_punto)
+        self._aplicar_estilo_nube()
+
+    def mostrar_clusters(self, pcd, etiquetas, seleccion=(),
+                         source_actor_name=None) -> None:
+        """Colorea la nube por cluster: uno visible es uno distinguible.
+
+        El ruido va en gris oscuro y lo seleccionado en verde, el mismo verde
+        que el resto de la app usa para "esto es lo que se va a llevar". Los
+        colores de cluster salen de un salto en el círculo cromático por la
+        razón áurea, de modo que dos clusters con ids consecutivos —que suelen
+        ser vecinos— quedan en colores bien distintos.
+        """
+        import colorsys
+
+        etiquetas = np.asarray(etiquetas)
+        pts = np.asarray(pcd.points)
+        sel = set(int(s) for s in seleccion)
+
+        nombres = ([] if source_actor_name is None else
+                   [source_actor_name] if isinstance(source_actor_name, str)
+                   else list(source_actor_name))
+        self._dimmed_actor = [n for n in nombres if n in self.plotter.actors]
+
+        colores = np.full((len(pts), 3), 0.25, dtype=np.float32)   # ruido
+        for cid in np.unique(etiquetas):
+            if cid == -1:
+                continue
+            m = etiquetas == cid
+            if int(cid) in sel:
+                colores[m] = (0.20, 0.90, 0.30)
+            else:
+                h = (int(cid) * 0.61803398875) % 1.0
+                colores[m] = colorsys.hsv_to_rgb(h, 0.65, 0.95)
+
+        centro = self._scene_center if self._scene_center is not None else 0.0
+        poly = pv.PolyData((pts - centro).astype(np.float32))
+        poly["RGB"] = (colores * 255).astype(np.uint8)
+        self.plotter.add_mesh(poly, scalars="RGB", rgb=True,
+                              point_size=self._tamano_punto,
+                              render_points_as_spheres=True, style="points",
+                              name="_clusters", reset_camera=False)
+        self._aplicar_estilo_nube()
+
+    def ocultar_clusters(self) -> None:
+        if "_clusters" in self.plotter.actors:
+            self.plotter.remove_actor("_clusters")
+        self._dimmed_actor = None
+        self._aplicar_estilo_nube()
 
     def clear_preview(self) -> None:
         """Quita los actores de previsualización y restaura la opacidad."""
-        for name in ("_preview_keep", "_preview_discard", "_lasso_selection"):
+        for name in self.ACTORES_PREVIEW:
             if name in self.plotter.actors:
                 self.plotter.remove_actor(name)
-        for nombre in (self._dimmed_actor or []):
-            actor = self.plotter.actors.get(nombre)
-            if actor is not None:
-                actor.GetProperty().SetOpacity(1.0)
         self._dimmed_actor = None
-        self.plotter.render()
+        self._aplicar_estilo_nube()
 
     def show_layers(self, stack) -> None:
         """
@@ -650,11 +1096,12 @@ class Viewer3D(QWidget):
             name = f"layer_{i}"
             poly = _o3d_to_pyvista(capa.pcd, center=self._scene_center)
             kwargs = dict(
-                point_size=2.0,
+                point_size=self._tamano_punto,
                 render_points_as_spheres=True,
                 style="points",
                 name=name,
-                opacity=1.0 if i == stack.active_index else 0.5,
+                opacity=(self._opacidad_nube if i == stack.active_index
+                         else self._opacidad_nube * 0.5),
                 # solo se encuadra la primera vez: tras un recorte el usuario
                 # quiere seguir mirando desde donde estaba
                 reset_camera=not self._camara_encuadrada,
@@ -667,7 +1114,7 @@ class Viewer3D(QWidget):
                 )
             self._active_actors.append(name)
         self._camara_encuadrada = True
-        self.plotter.render()
+        self._aplicar_estilo_nube()
 
     def set_actor_visibility(self, name: str, visible: bool) -> None:
         """Muestra u oculta un actor por nombre."""
