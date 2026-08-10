@@ -198,6 +198,33 @@ class DbscanWorker(QThread):
             self.error.emit(str(ex))
 
 
+class SimetriaWorker(QThread):
+    """Refina el plano de simetría en un hilo aparte.
+
+    Nelder-Mead evalúa el objetivo cientos de veces; sobre una entidad grande
+    son decenas de segundos incluso con las consultas paralelizadas.
+    """
+
+    finished = pyqtSignal(object, float)   # (PlanoSimetria, concordancia)
+    error    = pyqtSignal(str)
+
+    def __init__(self, pts, plano, tolerancia, zona=None, parent=None):
+        super().__init__(parent)
+        self._pts = pts
+        self._plano = plano
+        self._tolerancia = tolerancia
+        self._zona = zona
+
+    def run(self):
+        try:
+            from app.modules.simetria import refinar
+            plano, conc = refinar(self._pts, self._plano,
+                                  tolerancia=self._tolerancia, zona=self._zona)
+            self.finished.emit(plano, conc)
+        except Exception as ex:
+            self.error.emit(str(ex))
+
+
 class BaseWorker(QThread):
     """
     Worker genérico para operaciones futuras (ICP, Poisson, etc.).
