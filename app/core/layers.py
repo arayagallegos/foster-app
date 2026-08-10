@@ -203,6 +203,42 @@ class LayerStack:
         self.active_index = max(activa, 0)
         return n_div, n_ocul, n_intacta
 
+    def unir(self, indices, nombre: str) -> CloudLayer:
+        """Funde varias capas en una sola, que reemplaza a la primera.
+
+        Es la operación inversa del recorte, y sin ella el flujo de DBSCAN no
+        cierra: una entidad como la cúpula aparece partida en decenas de
+        clusters, y capturar cada uno por separado dejaría decenas de capas sin
+        manera de recomponer la entidad.
+
+        Las capas fuente desaparecen: la unión contiene exactamente sus puntos,
+        así que conservarlas solo duplicaría memoria.
+        """
+        indices = sorted(set(int(i) for i in indices))
+        if len(indices) < 2:
+            raise ValueError("Hay que elegir al menos dos capas para unir.")
+        if not all(0 <= i < len(self.layers) for i in indices):
+            raise IndexError("Alguna de las capas indicadas no existe.")
+        nombre = str(nombre).strip()
+        if not nombre:
+            raise ValueError("La capa unida necesita un nombre.")
+
+        origen = [self.layers[i] for i in indices]
+        pts = np.vstack([np.asarray(c.pcd.points) for c in origen])
+        unida = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+        if all(c.pcd.has_colors() for c in origen):
+            unida.colors = o3d.utility.Vector3dVector(
+                np.vstack([np.asarray(c.pcd.colors) for c in origen]))
+
+        capa = CloudLayer(name=nombre, pcd=unida, visible=True)
+        destino = indices[0]
+        self.layers = [
+            capa if i == destino else c
+            for i, c in enumerate(self.layers) if i == destino or i not in indices
+        ]
+        self.active_index = self.layers.index(capa)
+        return capa
+
     def contar_descartes(self) -> int:
         return sum(1 for c in self.layers if c.descarte)
 
@@ -225,6 +261,16 @@ class LayerStack:
         self.active_index = next(
             (i for i, c in enumerate(quedan) if c is activa), 0)
         return n
+
+    def renombrar(self, i: int, nombre: str) -> None:
+        """Renombra una capa. El nombre es lo que después identifica la entidad
+        al exportar, así que no puede quedar vacío."""
+        nombre = str(nombre).strip()
+        if not nombre:
+            raise ValueError("El nombre de la capa no puede estar vacío.")
+        if not 0 <= i < len(self.layers):
+            raise IndexError(f"No existe la capa {i}.")
+        self.layers[i].name = nombre
 
     def set_visible(self, i: int, visible: bool) -> None:
         self.layers[i].visible = bool(visible)

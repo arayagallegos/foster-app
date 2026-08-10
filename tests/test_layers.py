@@ -325,3 +325,81 @@ def test_eliminar_descartes_no_vacia_el_proyecto():
     with pytest.raises(ValueError):
         s.eliminar_descartes()
     assert len(s.layers) == 1
+
+
+# ---------- renombrar capas como entidades ---------- #
+
+def test_renombrar_capa():
+    """El nombre es lo que convierte una capa en una entidad identificable."""
+    s = _stack_de_prueba()
+    s.renombrar(1, "  Cúpula exterior  ")
+    assert s.layers[1].name == "Cúpula exterior"      # se limpian los espacios
+
+
+def test_renombrar_rechaza_nombre_vacio():
+    s = _stack_de_prueba()
+    antes = s.layers[0].name
+    for vacio in ("", "   "):
+        with pytest.raises(ValueError):
+            s.renombrar(0, vacio)
+    assert s.layers[0].name == antes
+
+
+def test_renombrar_indice_invalido():
+    s = _stack_de_prueba()
+    with pytest.raises(IndexError):
+        s.renombrar(99, "X")
+
+
+def test_el_nombre_sobrevive_al_recorte(tmp_path):
+    """Renombrar y luego recortar debe conservar la identidad en las dos mitades."""
+    s = _stack_de_prueba()
+    s.renombrar(1, "Compuertas")
+    s.split_visible_fino(_dentro_de_la_caja, lambda f: None, tmp_path)
+    hijas = [c.name for c in s.layers if "·" in c.name]
+    assert all(h.startswith("Compuertas") for h in hijas)
+
+
+# ---------- unir capas en una entidad ---------- #
+
+def test_unir_funde_las_capas_en_una():
+    """Sin esto el flujo de DBSCAN no cierra: la cúpula sale partida en decenas
+    de clusters y no habría manera de recomponerla."""
+    s = _stack_de_prueba()
+    n_total = sum(len(c.pcd.points) for c in (s.layers[0], s.layers[2]))
+    capa = s.unir([0, 2], "Cúpula")
+    assert capa.name == "Cúpula"
+    assert len(capa.pcd.points) == n_total
+    assert [c.name for c in s.layers] == ["Cúpula", "B partida", "D oculta"]
+
+
+def test_unir_deja_la_capa_nueva_activa_y_visible():
+    s = _stack_de_prueba()
+    s.layers[2].visible = False          # una de las fuentes estaba oculta
+    s.unir([0, 2], "Entidad")
+    assert s.active.name == "Entidad" and s.active.visible
+
+
+def test_unir_ocupa_la_posicion_de_la_primera():
+    s = _stack_de_prueba()
+    s.unir([1, 3], "X")
+    assert [c.name for c in s.layers] == ["A entera dentro", "X", "C entera fuera"]
+
+
+def test_unir_exige_al_menos_dos_capas():
+    s = _stack_de_prueba()
+    for indices in ([], [1], [1, 1]):
+        with pytest.raises(ValueError):
+            s.unir(indices, "X")
+
+
+def test_unir_exige_nombre():
+    s = _stack_de_prueba()
+    with pytest.raises(ValueError):
+        s.unir([0, 1], "   ")
+
+
+def test_unir_con_indice_inexistente():
+    s = _stack_de_prueba()
+    with pytest.raises(IndexError):
+        s.unir([0, 99], "X")
