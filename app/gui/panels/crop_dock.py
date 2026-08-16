@@ -1,6 +1,5 @@
 """
-crop_dock.py — Dock lateral de recorte: herramienta activa (caja o lazo),
-lista de capas y exportación.
+crop_dock.py — Dock lateral con los controles de la herramienta activa.
 
 No accede a Project ni Viewer: emite señales que MainWindow conecta.
 Colores de previsualización en toda la app: VERDE = se conserva, ROJO = se elimina.
@@ -9,11 +8,10 @@ Colores de previsualización en toda la app: VERDE = se conserva, ROJO = se elim
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QButtonGroup, QDockWidget, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
-    QCheckBox, QStackedWidget, QStyledItemDelegate, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QRadioButton, QSlider,
+    QCheckBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 # (etiqueta, valor de la senal, explicacion para tooltip y dialogo de ayuda)
@@ -49,27 +47,8 @@ _AYUDA = (
 )
 
 
-class _DelegadoNombreCapa(QStyledItemDelegate):
-    """Al editar, muestra SOLO el nombre de la capa.
-
-    La fila se ve como '🗑 Scan 03 · dentro 1 (12,345 pts)', pero el contador y
-    la marca de descarte son decoración calculada. Si el usuario editara ese
-    texto habría que reconstruir el nombre a partir de él, y bastaría un
-    paréntesis escrito a mano para romperlo. El nombre real viaja aparte, en
-    UserRole.
-    """
-
-    def setEditorData(self, editor, index) -> None:
-        editor.setText(index.data(Qt.ItemDataRole.UserRole) or "")
-
-    def setModelData(self, editor, model, index) -> None:
-        nombre = editor.text().strip()
-        if nombre:      # un nombre vacío dejaría la capa sin identificar
-            model.setData(index, nombre, Qt.ItemDataRole.UserRole)
-
-
 class CropDock(QDockWidget):
-    """Dock 'Recorte': herramienta activa + capas + exportación."""
+    """Dock con los controles de la herramienta activa."""
 
     # Herramienta caja
     tool_apply = pyqtSignal()
@@ -106,22 +85,10 @@ class CropDock(QDockWidget):
     lasso_started = pyqtSignal(str)   # set_op
     lasso_apply = pyqtSignal()
     lasso_cancel = pyqtSignal()
-    # Capas
-    layer_visibility_changed = pyqtSignal(int, bool)
-    layer_activated = pyqtSignal(int)
-    layer_removed = pyqtSignal(int)
-    layer_renamed = pyqtSignal(int, str)
-    layer_restore_requested = pyqtSignal()
-    layers_merge_requested = pyqtSignal(list)   # índices de capas a unir
-    discards_removal_requested = pyqtSignal()
-    export_requested = pyqtSignal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__("Recorte", parent)
-        self.setObjectName("crop_dock")
-        self._updating_layers = False
-        self._nombres: list[str] = []
-        self._visibles: list[bool] = []
+        super().__init__("Herramienta", parent)
+        self.setObjectName("tool_dock")
         self._build_ui()
 
     # ------------------------------------------------------------------ #
@@ -138,7 +105,7 @@ class CropDock(QDockWidget):
         fila_top = QWidget()
         ft = QHBoxLayout(fila_top)
         ft.setContentsMargins(0, 0, 0, 0)
-        btn_ayuda = QPushButton("ⓘ Ayuda")
+        btn_ayuda = QPushButton("Ayuda")
         btn_ayuda.setFixedWidth(80)
         btn_ayuda.clicked.connect(self._show_help)
         ft.addStretch(1)
@@ -159,67 +126,6 @@ class CropDock(QDockWidget):
         self._stack.addWidget(self._build_page_simetria())  # index 7
         tool_layout.addWidget(self._stack)
         layout.addWidget(self._tool_box)
-
-        # ---------- Capas ---------- #
-        box_capas = QGroupBox("Capas")
-        capas_layout = QVBoxLayout(box_capas)
-        self._layer_list = QListWidget()
-        self._layer_list.setToolTip(
-            "Fila seleccionada = capa activa (donde operan las herramientas).\n"
-            "Checkbox = mostrar/ocultar la capa.\n"
-            "Doble clic sobre el nombre para renombrar la entidad."
-        )
-        # selección múltiple: hace falta para unir varias capas en una entidad
-        self._layer_list.setSelectionMode(
-            QListWidget.SelectionMode.ExtendedSelection)
-        self._layer_list.setItemDelegate(_DelegadoNombreCapa(self._layer_list))
-        self._layer_list.itemChanged.connect(self._on_item_changed)
-        self._layer_list.currentRowChanged.connect(self._on_row_changed)
-        self._layer_list.itemSelectionChanged.connect(
-            self._on_layer_selection_changed)
-        capas_layout.addWidget(self._layer_list)
-
-        fila_capas = QWidget()
-        fc = QHBoxLayout(fila_capas)
-        fc.setContentsMargins(0, 0, 0, 0)
-        self._btn_remove_layer = QPushButton("Eliminar")
-        self._btn_remove_layer.setToolTip("Elimina la capa seleccionada (pide confirmación).")
-        self._btn_remove_layer.setEnabled(False)
-        self._btn_remove_layer.clicked.connect(self._emit_layer_removed)
-        self._btn_restore_layer = QPushButton("Restaurar eliminada")
-        self._btn_restore_layer.setToolTip("Deshace la última eliminación de capa.")
-        self._btn_restore_layer.setEnabled(False)
-        self._btn_restore_layer.clicked.connect(self.layer_restore_requested)
-        fc.addWidget(self._btn_remove_layer)
-        fc.addWidget(self._btn_restore_layer)
-        capas_layout.addWidget(fila_capas)
-
-        # Un recorte sobre 35 scans puede dejar decenas de capas fuera; borrarlas
-        # una a una es impracticable.
-        self._btn_remove_discards = QPushButton("Eliminar descartes")
-        self._btn_remove_discards.setToolTip(
-            "Elimina de una vez todas las capas marcadas con 🗑 "
-            "(lo que quedó fuera de los recortes).")
-        self._btn_remove_discards.setEnabled(False)
-        self._btn_remove_discards.clicked.connect(self.discards_removal_requested)
-        capas_layout.addWidget(self._btn_remove_discards)
-
-        # La operación inversa del recorte: sin ella, una entidad partida en
-        # decenas de clusters no se puede recomponer.
-        self._btn_merge_layers = QPushButton("Unir seleccionadas")
-        self._btn_merge_layers.setToolTip(
-            "Funde en una sola capa las capas marcadas (Ctrl o Shift para "
-            "marcar varias). Útil cuando una entidad quedó partida.")
-        self._btn_merge_layers.setEnabled(False)
-        self._btn_merge_layers.clicked.connect(self._emit_merge_layers)
-        capas_layout.addWidget(self._btn_merge_layers)
-        layout.addWidget(box_capas)
-
-        # ---------- Exportar ---------- #
-        self._btn_export = QPushButton("Exportar visibles (.ply)")
-        self._btn_export.setToolTip("Une las capas visibles y las guarda en un .ply.")
-        self._btn_export.clicked.connect(self.export_requested)
-        layout.addWidget(self._btn_export)
 
         layout.addStretch(1)
         self.setWidget(contenido)
@@ -830,84 +736,12 @@ class CropDock(QDockWidget):
     def set_lasso_has_selection(self, has: bool) -> None:
         self._btn_apply_lasso.setEnabled(bool(has))
 
-    def set_restore_available(self, available: bool) -> None:
-        self._btn_restore_layer.setEnabled(bool(available))
-
-    def refresh_layers(self, stack) -> None:
-        """Repuebla la lista desde el LayerStack (checkbox=visible, fila=activa)."""
-        self._updating_layers = True
-        try:
-            self._layer_list.clear()
-            for capa in stack:
-                n = len(capa.pcd.points)
-                marca = "🗑 " if getattr(capa, "descarte", False) else ""
-                item = QListWidgetItem(f"{marca}{capa.name} ({n:,} pts)")
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(
-                    Qt.CheckState.Checked if capa.visible else Qt.CheckState.Unchecked
-                )
-                if getattr(capa, "descarte", False):
-                    item.setForeground(QColor("#8a6060"))   # atenuado: es basura
-                # el nombre real, sin decoración: es lo que se edita
-                item.setData(Qt.ItemDataRole.UserRole, capa.name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                self._layer_list.addItem(item)
-            self._nombres = [c.name for c in stack]
-            self._visibles = [bool(c.visible) for c in stack]
-            self._layer_list.setCurrentRow(stack.active_index)
-            self._btn_remove_layer.setEnabled(len(stack) > 1)
-
-            n_desc = stack.contar_descartes()
-            self._btn_remove_discards.setEnabled(0 < n_desc < len(stack))
-            self._btn_remove_discards.setText(
-                f"Eliminar descartes ({n_desc})" if n_desc else "Eliminar descartes")
-        finally:
-            self._updating_layers = False
-
     # ------------------------------------------------------------------ #
     # Internos                                                              #
     # ------------------------------------------------------------------ #
 
-    def _emit_merge_layers(self) -> None:
-        filas = sorted(self._layer_list.row(it)
-                       for it in self._layer_list.selectedItems())
-        if len(filas) >= 2:
-            self.layers_merge_requested.emit(filas)
-
-    def _on_layer_selection_changed(self) -> None:
-        self._btn_merge_layers.setEnabled(
-            len(self._layer_list.selectedItems()) >= 2)
-
     def _show_help(self) -> None:
         QMessageBox.information(self, "Ayuda — Recorte", _AYUDA)
-
-    def _on_item_changed(self, item) -> None:
-        """itemChanged cubre tanto el checkbox como el renombre: hay que mirar
-        qué cambió respecto del último refresco para saber cuál de los dos fue."""
-        if self._updating_layers:
-            return
-        i = self._layer_list.row(item)
-        if not 0 <= i < len(self._nombres):
-            return
-        nombre = item.data(Qt.ItemDataRole.UserRole)
-        if nombre and nombre != self._nombres[i]:
-            self._nombres[i] = nombre
-            self.layer_renamed.emit(i, nombre)
-            return
-        self._visibles[i] = item.checkState() == Qt.CheckState.Checked
-        self.layer_visibility_changed.emit(
-            i, item.checkState() == Qt.CheckState.Checked
-        )
-
-    def _on_row_changed(self, row: int) -> None:
-        if self._updating_layers or row < 0:
-            return
-        self.layer_activated.emit(row)
-
-    def _emit_layer_removed(self) -> None:
-        row = self._layer_list.currentRow()
-        if row >= 0:
-            self.layer_removed.emit(row)
 
     def _emit_lasso_started(self) -> None:
         checked = self._lasso_op_group.checkedButton()

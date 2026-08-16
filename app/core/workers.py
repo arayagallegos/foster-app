@@ -47,54 +47,6 @@ class LoadWorker(QThread):
             self.error.emit(str(ex))
 
 
-class RegistrationWorker(QThread):
-    """
-    Registra múltiples scans de un e57 en un hilo separado.
-    Emite progreso durante el proceso (puede tardar varios minutos).
-    """
-
-    finished = pyqtSignal(object, str)  # (PointCloud registrada, path)
-    error    = pyqtSignal(str)
-    progress = pyqtSignal(int)
-    status   = pyqtSignal(str)
-
-    def __init__(self, path: str, parent=None):
-        super().__init__(parent)
-        self._path = path
-
-    def run(self):
-        try:
-            from app.core.io import load_e57_scans
-            from app.modules.fusion import register_scans
-
-            self.status.emit("Leyendo scans individuales...")
-            self.progress.emit(5)
-
-            scans = load_e57_scans(self._path, voxel_size=0.05)
-
-            if not scans:
-                self.error.emit("No se encontraron scans válidos en el archivo.")
-                return
-
-            if len(scans) == 1:
-                # Solo un scan: no hay nada que registrar
-                self.status.emit("Solo un scan encontrado, sin necesidad de registro.")
-                self.progress.emit(100)
-                self.finished.emit(scans[0][0], self._path)
-                return
-
-            def on_progress(pct, msg):
-                self.progress.emit(5 + int(pct * 0.9))
-                self.status.emit(msg)
-
-            registered = register_scans(scans, progress_cb=on_progress)
-            self.progress.emit(100)
-            self.finished.emit(registered, self._path)
-
-        except Exception as ex:
-            self.error.emit(str(ex))
-
-
 class ScanLayersWorker(QThread):
     """Carga los scans del .e57 como capas (con caché) en un hilo aparte."""
 

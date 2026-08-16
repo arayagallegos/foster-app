@@ -35,7 +35,24 @@ from app.core.project import Project
 from app.core.workers import LoadWorker
 from app.gui.viewer import Viewer3D
 from app.gui.panels.crop_dock import CropDock
+from app.gui.panels.layer_dock import LayerDock
 from app.gui.panels.info_panel import InfoPanel
+
+
+def _e57_total_puntos(path: str | None) -> int | None:
+    """Puntos que contiene el archivo, leídos de las cabeceras.
+
+    Se lee del encabezado y no de los datos: es instantáneo aunque el archivo
+    pese decenas de gigas.
+    """
+    if not path or not path.lower().endswith(".e57"):
+        return None
+    try:
+        import pye57
+        e = pye57.E57(path)
+        return sum(e.get_header(i).point_count for i in range(e.scan_count))
+    except Exception:
+        return None
 
 
 def _e57_scan_count_safe(path: str) -> int:
@@ -60,6 +77,7 @@ class MainWindow(QMainWindow):
         self.project = Project()
         self.settings = QSettings("LabPatrimonio", "FosterApp")
         self._crop_dock: CropDock | None = None
+        self._layer_dock: LayerDock | None = None
         self._layer_stack: LayerStack | None = None
         self._active_tool: str | None = None   # None | "caja" | "lazo"
         self._crop_min: np.ndarray | None = None
@@ -133,7 +151,7 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
 
         # --- Cargar LiDAR ---
-        self._act_load_lidar = QAction("📡  Cargar LiDAR", self)
+        self._act_load_lidar = QAction("Cargar LiDAR", self)
         self._act_load_lidar.setShortcut(QKeySequence("Ctrl+L"))
         self._act_load_lidar.setToolTip(
             "Cargar nube de puntos LiDAR (.e57, .las, .laz, .ply)\n"
@@ -142,60 +160,39 @@ class MainWindow(QMainWindow):
         self._act_load_lidar.triggered.connect(self._on_load_lidar)
         tb.addAction(self._act_load_lidar)
 
-        # --- Registrar scans e57 ---
-        self._act_register = QAction("🔗  Registrar scans", self)
-        self._act_register.setShortcut(QKeySequence("Ctrl+R"))
-        self._act_register.setToolTip(
-            "Cargar .e57 y registrar múltiples scans automáticamente\n"
-            "(RANSAC + ICP + Pose graph optimization)\n"
-            "Atajo: Ctrl+R"
+        # Va junto a la carga, no en Recortar: no recorta nada, vuelve a leer el
+        # archivo original con otra resolución. Queda deshabilitada hasta que
+        # haya una caja, porque necesita saber qué región releer.
+        self._act_recachear = QAction("Re-cachear a resolución fina…", self)
+        self._act_recachear.setToolTip(
+            "Vuelve a leer el .e57 quedándose solo con la caja de recorte "
+            "actual, usando un vóxel más fino. Requiere una caja definida y "
+            "tarda varios minutos."
         )
-        self._act_register.triggered.connect(self._on_register_scans)
-        tb.addAction(self._act_register)
+        self._act_recachear.setEnabled(False)
+        self._act_recachear.triggered.connect(self._on_recachear)
+        tb.addAction(self._act_recachear)
 
-
-        # --- Cargar Fotogrametría ---
-        self._act_load_photo = QAction("📷  Cargar Fotogrametría", self)
-        self._act_load_photo.setShortcut(QKeySequence("Ctrl+F"))
-        self._act_load_photo.setToolTip(
-            "Cargar nube de fotogrametría (.ply)\n"
-            "Atajo: Ctrl+F"
-        )
-        self._act_load_photo.triggered.connect(self._on_load_photo)
-        tb.addAction(self._act_load_photo)
 
         tb.addSeparator()
 
-        # --- Vistas de cámara ---
-        act_iso = QAction("⬡  Isométrica", self)
-        act_iso.triggered.connect(self.viewer.set_view_isometric)
-        tb.addAction(act_iso)
-
-        act_top = QAction("⬆  Planta", self)
-        act_top.triggered.connect(self.viewer.set_view_top)
-        tb.addAction(act_top)
-
-        act_front = QAction("⬛  Frente", self)
-        act_front.triggered.connect(self.viewer.set_view_front)
-        tb.addAction(act_front)
-
+        tb.addWidget(self._menu_vistas())
         tb.addWidget(self._menu_camara())
         tb.addWidget(self._menu_visibilidad())
-
-        # Cambiar la vista con un lazo a medio dibujar mezclaría vértices de
-        # cámaras distintas: se bloquean mientras el lazo está activo.
-        self._acts_vista = (act_iso, act_top, act_front)
 
         tb.addSeparator()
 
         # --- Recortar nube (menú desplegable Caja / Lazo) ---
         self._btn_crop = QToolButton()
-        self._btn_crop.setText("✂  Recortar")
+        self._btn_crop.setText("Recortar")
         self._btn_crop.setToolTip("Herramientas de recorte de la nube")
         self._btn_crop.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._btn_crop.setEnabled(False)
 
         menu_crop = QMenu(self._btn_crop)
+        self._nota(menu_crop,
+                   "Quita lo que sobra. La capa se divide en lo conservado y "
+                   "lo descartado; nada se pierde hasta que elimines una capa.")
         # Un solo grupo para los DOS menús: las herramientas siguen siendo
         # mutuamente excluyentes aunque estén repartidas en dos botones.
         grupo = QActionGroup(self)
@@ -209,38 +206,33 @@ class MainWindow(QMainWindow):
             return act
 
         # Recortar: quitar lo que sobra de la nube
-        self._act_tool_caja = _accion("⬜  Caja", "caja")
-        self._act_tool_lazo = _accion("➰  Lazo", "lazo")
+        self._act_tool_caja = _accion("Caja", "caja")
+        self._act_tool_lazo = _accion("Lazo", "lazo")
         for act in (self._act_tool_caja, self._act_tool_lazo):
             menu_crop.addAction(act)
 
-        menu_crop.addSeparator()
-        self._act_recachear = QAction("🔍  Re-cachear a resolución fina…", self)
-        self._act_recachear.setToolTip(
-            "Vuelve a leer el .e57 quedándose solo con la caja actual, "
-            "usando un vóxel más fino. Tarda varios minutos."
-        )
-        self._act_recachear.setEnabled(False)
-        self._act_recachear.triggered.connect(self._on_recachear)
-        menu_crop.addAction(self._act_recachear)
         self._btn_crop.setMenu(menu_crop)
         tb.addWidget(self._btn_crop)
 
         # Segmentar: extraer entidades de lo que queda
         self._btn_seg = QToolButton()
-        self._btn_seg.setText("◈  Segmentar")
+        self._btn_seg.setText("Segmentar")
         self._btn_seg.setToolTip(
             "Primitivas que se ajustan a los datos y capturan una entidad")
         self._btn_seg.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self._btn_seg.setEnabled(False)
 
         menu_seg = QMenu(self._btn_seg)
-        self._act_tool_esfera = _accion("⚪  Esfera", "esfera")
-        self._act_tool_plano = _accion("▱  Plano", "plano")
-        self._act_tool_cilindro = _accion("⬭  Cilindro", "cilindro")
-        self._act_tool_cono = _accion("◺  Cono", "cono")
-        self._act_tool_dbscan = _accion("⁙  Agrupar (DBSCAN)", "dbscan")
-        self._act_tool_simetria = _accion("⧉  Reparar por simetría", "simetria")
+        self._nota(menu_seg,
+                   "Extrae una entidad. Las primitivas ajustan una forma "
+                   "conocida a los datos; agrupar y reparar operan sobre lo que "
+                   "queda. Cada herramienta se explica en el panel lateral.")
+        self._act_tool_esfera = _accion("Esfera", "esfera")
+        self._act_tool_plano = _accion("Plano", "plano")
+        self._act_tool_cilindro = _accion("Cilindro", "cilindro")
+        self._act_tool_cono = _accion("Cono", "cono")
+        self._act_tool_dbscan = _accion("Agrupar (DBSCAN)", "dbscan")
+        self._act_tool_simetria = _accion("Reparar por simetría", "simetria")
         for act in (self._act_tool_esfera, self._act_tool_plano,
                     self._act_tool_cilindro, self._act_tool_cono):
             menu_seg.addAction(act)
@@ -258,7 +250,7 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # --- Limpiar escena ---
-        act_clear = QAction("🗑  Limpiar", self)
+        act_clear = QAction("Limpiar", self)
         act_clear.setToolTip("Limpiar escena y proyecto actual")
         act_clear.triggered.connect(self._on_clear)
         tb.addAction(act_clear)
@@ -267,6 +259,51 @@ class MainWindow(QMainWindow):
         """Recortar y Segmentar dependen de lo mismo: que haya nube cargada."""
         self._btn_crop.setEnabled(bool(activo))
         self._btn_seg.setEnabled(bool(activo))
+
+    @staticmethod
+    def _nota(menu: QMenu, texto: str) -> None:
+        """Añade una línea explicativa dentro de un menú.
+
+        Los tooltips solo aparecen al posarse encima y solo uno a la vez; para
+        opciones cuyo funcionamiento no es evidente por el nombre, la
+        explicación tiene que estar a la vista junto a la opción.
+        """
+        etiqueta = QLabel(texto)
+        etiqueta.setWordWrap(True)
+        etiqueta.setContentsMargins(28, 0, 12, 6)
+        etiqueta.setStyleSheet("color: #999999; font-size: 11px;")
+        etiqueta.setMaximumWidth(300)
+        accion = QWidgetAction(menu)
+        accion.setDefaultWidget(etiqueta)
+        menu.addAction(accion)
+
+    def _menu_vistas(self) -> QToolButton:
+        """Menú Vista: las seis caras del cubo más la isométrica.
+
+        En una estructura de revolución como la cúpula, mirar desde un lado u
+        otro cambia por completo qué queda ocluido, así que las tres vistas
+        iniciales resultaban insuficientes.
+        """
+        btn = QToolButton()
+        btn.setText("Vista")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+
+        self._nota(menu, "Coloca la cámara en una vista fija. El zoom y el "
+                         "desplazamiento se conservan.")
+        self._acts_vista = []
+        for i, (clave, etiqueta, _m, _n) in enumerate(self.viewer.VISTAS):
+            act = QAction(etiqueta, self)
+            act.triggered.connect(lambda _=False, c=clave: self.viewer.set_view(c))
+            menu.addAction(act)
+            self._acts_vista.append(act)
+            if i == 0:              # separa la isométrica de las caras
+                menu.addSeparator()
+        # Cambiar la vista con un lazo a medio dibujar mezclaría vértices de
+        # cámaras distintas: se bloquean mientras el lazo está activo.
+        self._acts_vista = tuple(self._acts_vista)
+        btn.setMenu(menu)
+        return btn
 
     def _menu_camara(self) -> QToolButton:
         """Menú Cámara: modos de navegación, ambos apagados por defecto.
@@ -287,6 +324,10 @@ class MainWindow(QMainWindow):
             "agarrar los manipuladores. Activa también WASD.")
         self._act_fps.toggled.connect(self._on_fps_toggled)
         menu.addAction(self._act_fps)
+        self._nota(menu,
+                   "Mantén el BOTÓN DERECHO y mueve el mouse para mirar, como "
+                   "en un juego en primera persona. Al soltarlo recuperas el "
+                   "cursor. Activa también WASD.")
 
         self._act_wasd = QAction("Navegación con teclado (WASD)", self, checkable=True)
         self._act_wasd.setToolTip(
@@ -295,6 +336,16 @@ class MainWindow(QMainWindow):
             "distancia: cerca de la superficie es fino.")
         self._act_wasd.toggled.connect(self._on_wasd_toggled)
         menu.addAction(self._act_wasd)
+        self._nota(menu,
+                   "W/S avanzar y retroceder · A/D lateral · E/Q subir y bajar. "
+                   "Con Shift el paso es 4× mayor. El paso se adapta a la "
+                   "distancia: cerca de la superficie es fino.")
+
+        menu.addSeparator()
+        self._nota(menu,
+                   "Ratón: arrastrar desplaza la nube · botón derecho gira · "
+                   "Shift+arrastrar gira · rueda hace zoom.")
+
 
         btn.setMenu(menu)
         return btn
@@ -314,6 +365,14 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         lay = QVBoxLayout(panel)
         lay.setContentsMargins(10, 8, 10, 8)
+
+        intro = QLabel("Baja la opacidad o el tamaño de punto para ver los "
+                       "manipuladores de una primitiva cuando quedan dentro de "
+                       "la estructura.")
+        intro.setWordWrap(True)
+        intro.setMaximumWidth(280)
+        intro.setStyleSheet("color: #999999; font-size: 11px;")
+        lay.addWidget(intro)
 
         self._lbl_opacidad = QLabel()
         self._sld_opacidad = QSlider(Qt.Orientation.Horizontal)
@@ -495,32 +554,6 @@ class MainWindow(QMainWindow):
     # Acciones de la toolbar                                               #
     # ------------------------------------------------------------------ #
 
-    def _on_register_scans(self):
-        """Carga un .e57 y registra sus scans automáticamente."""
-        from app.core.io import FILTER_STRING
-        last_dir = self.settings.value("io/last_dir", os.path.expanduser("~"))
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Seleccionar archivo .e57 para registro",
-            last_dir, "E57 (*.e57);;Todos los archivos (*)"
-        )
-        if not path:
-            return
-
-        self.settings.setValue("io/last_dir", os.path.dirname(path))
-        self.show_status("Iniciando registro de scans (puede tardar varios minutos)...")
-        self._set_loading(True)
-
-        from app.core.workers import RegistrationWorker
-        worker = RegistrationWorker(path, parent=self)
-        worker.progress.connect(self._progress.setValue)
-        worker.status.connect(self.show_status)
-        worker.finished.connect(
-            lambda pcd, p: self._on_cloud_loaded(pcd, p, "lidar")
-        )
-        worker.error.connect(self._on_load_error)
-        self._current_worker = worker
-        worker.start()
-
     def _on_load_lidar(self):
         """Carga LiDAR: un .e57 con varios scans se abre como capas por scan;
         cualquier otro archivo (o .e57 de un scan) como nube única."""
@@ -530,17 +563,22 @@ class MainWindow(QMainWindow):
         if _e57_scan_count_safe(path) >= 2:
             self._cargar_scans_por_capas(path)
         else:
-            self._cargar_nube_unica(path, "lidar")
+            self._cargar_nube_unica(path)
 
-    def _cargar_nube_unica(self, path: str, cloud_type: str) -> None:
-        self._load_cloud(path, cloud_type=cloud_type)
+    def _cargar_nube_unica(self, path: str) -> None:
+        self._load_cloud(path)
 
-    def _on_load_photo(self):
-        """Abre diálogo para cargar nube de fotogrametría."""
-        path = self._open_file_dialog("Cargar nube de fotogrametría")
-        if not path:
-            return
-        self._load_cloud(path, cloud_type="photo")
+    @staticmethod
+    def _espaciado_de(pcd):
+        """Distancia típica entre puntos vecinos. Es el dato que gobierna el
+        vóxel del caché, el eps de la agrupación y la tolerancia de las
+        primitivas; mostrarlo evita que el usuario lo deduzca probando."""
+        try:
+            from app.modules.clusters import espaciado_medio
+            pts = np.asarray(pcd.points)
+            return espaciado_medio(pts) if len(pts) > 1 else None
+        except Exception:
+            return None
 
     def _cargar_scans_por_capas(self, path: str) -> None:
         """Carga el .e57 como una capa por scan (con caché de dos resoluciones)."""
@@ -570,14 +608,39 @@ class MainWindow(QMainWindow):
         ]
         stack.active_index = 0
         self._layer_stack = stack
+        # El panel de información solo se actualizaba en la carga de nube única;
+        # con la carga por capas —que es el camino habitual— quedaba en blanco.
+        self._actualizar_info_de_capas(scans)
         self.viewer.show_layers(stack)
-        dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
-        dock.show()
+        # Solo el dock de capas: el de herramientas aparece al activar una.
+        self._ensure_layer_dock().refresh_layers(stack)
         self._habilitar_herramientas(True)
         self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — scans")
         self.show_status(f"{len(scans)} scans cargados como capas. "
                          "Apaga los interiores y usa 'Exportar visibles'.")
+
+    def _actualizar_info_de_capas(self, scans) -> None:
+        """Refleja en el panel la nube cargada por capas."""
+        from app.core.project import CloudInfo
+
+        pts = np.vstack([np.asarray(s.pcd_grueso.points) for s in scans])
+        en_cache = sum(s.n_pts_fino for s in scans)
+        # El caché guarda los puntos YA voxelizados: informar ese número como si
+        # fuera el del archivo da una idea equivocada del dato de partida.
+        del_archivo = _e57_total_puntos(self._e57_path) or en_cache
+        self.project.lidar_info = CloudInfo(
+            name=Path(self._e57_path).stem if self._e57_path else "escaneos",
+            path=self._e57_path or "",
+            n_points_original=del_archivo,
+            n_points_display=len(pts),
+            has_colors=bool(scans and scans[0].pcd_grueso.has_colors()),
+            bbox_min=pts.min(axis=0), bbox_max=pts.max(axis=0),
+        )
+        self.info_panel.set_scan_count(len(scans))
+        self.info_panel.set_puntos_en_cache(en_cache)
+        self.info_panel.set_espaciado(self._espaciado_de(scans[0].pcd_grueso))
+        self.info_panel.update_from_project(self.project)
+        self.info_panel.update_display_count(en_cache, len(pts))
 
     def _on_clear(self):
         """Limpia la escena y reinicia el proyecto."""
@@ -619,38 +682,29 @@ class MainWindow(QMainWindow):
     # Carga de nubes (en background)                                       #
     # ------------------------------------------------------------------ #
 
-    def _load_cloud(self, path: str, cloud_type: str):
-        """
-        Lanza el worker de carga en background.
-        cloud_type: "lidar" | "photo"
-        """
-        name = "LiDAR" if cloud_type == "lidar" else "Fotogrametría"
-        self.show_status(f"Cargando {name}...")
+    def _load_cloud(self, path: str):
+        """Lanza el worker de carga en background."""
+        self.show_status("Cargando nube de puntos...")
         self._set_loading(True)
 
         worker = LoadWorker(path, parent=self)
         worker.progress.connect(self._progress.setValue)
-        worker.finished.connect(
-            lambda pcd, p: self._on_cloud_loaded(pcd, p, cloud_type)
-        )
+        worker.finished.connect(self._on_cloud_loaded)
         worker.error.connect(self._on_load_error)
 
         # Guardar referencia para evitar que el GC destruya el worker
         self._current_worker = worker
         worker.start()
 
-    def _on_cloud_loaded(self, pcd, path: str, cloud_type: str):
+    def _on_cloud_loaded(self, pcd, path: str):
         """Callback cuando el worker termina de cargar la nube."""
         self._set_loading(False)
-        actor_name = f"cloud_{cloud_type}"
+        self.project.set_lidar(pcd, path)
+        self.viewer.show_cloud(pcd, name="cloud_lidar", point_size=2.0)
 
-        if cloud_type == "lidar":
-            self.project.set_lidar(pcd, path)
-            self.viewer.show_cloud(pcd, name=actor_name, point_size=2.0)
-        else:
-            self.project.set_photo(pcd, path)
-            self.viewer.show_cloud(pcd, name=actor_name, point_size=1.5)
-
+        self.info_panel.set_scan_count(_e57_scan_count_safe(path)
+                                       if path.lower().endswith(".e57") else None)
+        self.info_panel.set_espaciado(self._espaciado_de(pcd))
         self.info_panel.update_from_project(self.project)
         self.setWindowTitle(
             f"{self.APP_NAME} v{self.VERSION} — {self.project.name}"
@@ -690,8 +744,7 @@ class MainWindow(QMainWindow):
     def _set_loading(self, loading: bool):
         self._progress.setVisible(loading)
         self._act_load_lidar.setEnabled(not loading)
-        self._act_load_photo.setEnabled(not loading)
-        self._act_register.setEnabled(not loading)
+
         if loading:
             self._progress.setValue(0)
         QApplication.processEvents()
@@ -699,6 +752,41 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     # Recorte interactivo                                                  #
     # ------------------------------------------------------------------ #
+
+    def _ensure_layer_dock(self) -> LayerDock:
+        """Crea el dock de capas la primera vez. Existe desde que hay nube, a
+        diferencia del de herramientas, que solo aparece al usar una."""
+        if self._layer_dock is None:
+            dock = LayerDock(self)
+            dock.layer_visibility_changed.connect(self._on_layer_visibility)
+            dock.layer_activated.connect(self._on_layer_activated)
+            dock.layer_removed.connect(self._on_layer_removed)
+            dock.layer_renamed.connect(self._on_layer_renamed)
+            dock.layer_restore_requested.connect(self._on_layer_restore)
+            dock.layers_merge_requested.connect(self._on_layers_merge)
+            dock.layers_visibility_changed.connect(self._on_layers_visibility)
+            dock.layers_isolate_requested.connect(self._on_layers_isolate)
+            dock.layers_invert_requested.connect(self._on_layers_invert)
+            dock.discards_removal_requested.connect(self._on_remove_discards)
+            dock.export_requested.connect(self._on_export_visible)
+            self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            self._layer_dock = dock
+        return self._layer_dock
+
+    def _repartir_docks(self) -> None:
+        """Da a cada dock una altura razonable cuando ambos están visibles.
+
+        Sin esto, Qt reparte el área a partes iguales y la lista de capas puede
+        quedar en una sola fila.
+        """
+        if self._layer_dock is None or self._crop_dock is None:
+            return
+        if not self._crop_dock.isVisible():
+            return
+        alto = max(self.height(), 600)
+        self.resizeDocks([self._layer_dock, self._crop_dock],
+                         [int(alto * 0.45), int(alto * 0.55)],
+                         Qt.Orientation.Vertical)
 
     def _ensure_crop_dock(self) -> CropDock:
         if self._crop_dock is None:
@@ -710,12 +798,6 @@ class MainWindow(QMainWindow):
             dock.lasso_started.connect(self._on_lasso_started)
             dock.lasso_apply.connect(self._on_lasso_apply)
             dock.lasso_cancel.connect(self._on_lasso_cancel)
-            dock.layer_visibility_changed.connect(self._on_layer_visibility)
-            dock.layer_activated.connect(self._on_layer_activated)
-            dock.layer_removed.connect(self._on_layer_removed)
-            dock.layer_restore_requested.connect(self._on_layer_restore)
-            dock.layer_renamed.connect(self._on_layer_renamed)
-            dock.discards_removal_requested.connect(self._on_remove_discards)
             dock.plano_params_changed.connect(self._on_plano_params)
             dock.plano_capturar.connect(self._on_plano_capturar)
             dock.plano_reajustar.connect(self._on_plano_reajustar)
@@ -730,12 +812,15 @@ class MainWindow(QMainWindow):
             dock.dbscan_seleccion_changed.connect(self._on_dbscan_seleccion)
             dock.dbscan_capturar.connect(self._on_dbscan_capturar)
             dock.dbscan_eliminar.connect(self._on_dbscan_eliminar)
-            dock.layers_merge_requested.connect(self._on_layers_merge)
             dock.simetria_params_changed.connect(self._on_simetria_params)
             dock.simetria_refinar.connect(self._on_simetria_refinar)
             dock.simetria_aplicar.connect(self._on_simetria_aplicar)
-            dock.export_requested.connect(self._on_export_visible)
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+            # Crear NO es mostrar: varias operaciones sobre capas necesitan el
+            # dock para apagar el lazo, y si crearlo lo hiciera visible el panel
+            # de herramientas aparecería sin herramienta activa, robándole
+            # espacio a la lista de capas.
+            dock.hide()
             self._crop_dock = dock
         return self._crop_dock
 
@@ -769,8 +854,10 @@ class MainWindow(QMainWindow):
         self._deactivate_tools(keep_checked=tool)
         dock = self._ensure_crop_dock()
         dock.set_tool(tool)
-        dock.refresh_layers(self._layer_stack)
+        self._ensure_layer_dock().refresh_layers(self._layer_stack)
         dock.show()
+        dock.raise_()
+        self._repartir_docks()
         self._active_tool = tool
         if tool == "caja":
             self.viewer.start_crop_widget(
@@ -874,8 +961,8 @@ class MainWindow(QMainWindow):
         self._crop_max = None
         self._active_tool = None
         if self._crop_dock is not None:
-            self._crop_dock.set_lasso_active(False)
-            self._crop_dock.set_lasso_has_selection(False)
+            self._ensure_crop_dock().set_lasso_active(False)
+            self._ensure_crop_dock().set_lasso_has_selection(False)
         for act in self._acts_tool:
             if act.data() != keep_checked:
                 act.setChecked(False)
@@ -935,7 +1022,7 @@ class MainWindow(QMainWindow):
         self.viewer.clear_preview()
         self.viewer.show_layers(stack)
         dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         dock.set_lasso_active(False)
         dock.set_lasso_has_selection(False)
 
@@ -980,7 +1067,7 @@ class MainWindow(QMainWindow):
         except (ValueError, IndexError) as e:
             self.show_status(str(e))
             return
-        self._ensure_crop_dock().refresh_layers(self._layer_stack)
+        self._ensure_layer_dock().refresh_layers(self._layer_stack)
         self.show_status(f"Capa renombrada a '{nombre}'.")
 
     def _on_remove_discards(self) -> None:
@@ -1008,7 +1095,7 @@ class MainWindow(QMainWindow):
             return
         self._deactivate_tools()
         self.viewer.show_layers(stack)
-        self._ensure_crop_dock().refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         self.show_status(f"{n} capas de descarte eliminadas.")
 
     def _apply_split_visible(self) -> None:
@@ -1033,7 +1120,7 @@ class MainWindow(QMainWindow):
         self.viewer.clear_preview()
         self.viewer.show_layers(stack)
         dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         if self._active_tool == "caja":
             self.viewer.start_crop_widget(
                 stack.active.pcd, callback=self._on_crop_bounds_changed
@@ -1713,7 +1800,7 @@ class MainWindow(QMainWindow):
         self.viewer.ocultar_clusters()
         self.viewer.show_layers(stack)
         dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         dock.refresh_clusters([])
         self._mostrar_referencia_dbscan()
         self.show_status(
@@ -1741,11 +1828,45 @@ class MainWindow(QMainWindow):
         self.viewer.ocultar_clusters()
         self.viewer.show_layers(stack)
         dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         dock.refresh_clusters([])
         self._mostrar_referencia_dbscan()
         self.show_status(f"{n:,} puntos eliminados. Vuelve a agrupar si quieres "
                          "seguir limpiando.")
+
+    def _refrescar_visibilidad(self) -> None:
+        """Redibuja tras un cambio de visibilidad en bloque."""
+        stack = self._layer_stack
+        self.viewer.show_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
+        n = sum(1 for c in stack.layers if c.visible)
+        self.show_status(f"{n} de {len(stack.layers)} capas visibles.")
+
+    def _on_layers_visibility(self, indices, visible: bool) -> None:
+        if self._layer_stack is None:
+            return
+        try:
+            self._layer_stack.set_visibles(indices, visible)
+        except IndexError as e:
+            self.show_status(str(e))
+            return
+        self._refrescar_visibilidad()
+
+    def _on_layers_isolate(self, indices) -> None:
+        if self._layer_stack is None:
+            return
+        try:
+            self._layer_stack.mostrar_solo(indices)
+        except (ValueError, IndexError) as e:
+            self.show_status(str(e))
+            return
+        self._refrescar_visibilidad()
+
+    def _on_layers_invert(self) -> None:
+        if self._layer_stack is None:
+            return
+        self._layer_stack.invertir_visibilidad()
+        self._refrescar_visibilidad()
 
     def _on_layers_merge(self, indices) -> None:
         """Une varias capas en una entidad."""
@@ -1764,7 +1885,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Unir capas", str(e))
             return
         self.viewer.show_layers(self._layer_stack)
-        self._ensure_crop_dock().refresh_layers(self._layer_stack)
+        self._ensure_layer_dock().refresh_layers(self._layer_stack)
         self.show_status(f"{len(indices)} capas unidas en "
                          f"'{capa.name}' ({len(capa.pcd.points):,} pts).")
 
@@ -1866,7 +1987,7 @@ class MainWindow(QMainWindow):
         self.viewer.ocultar_relleno()
         self.viewer.show_layers(stack)
         dock = self._ensure_crop_dock()
-        dock.refresh_layers(stack)
+        self._ensure_layer_dock().refresh_layers(stack)
         dock.set_simetria_concordancia(None)
         self.show_status(
             f"Capa '{nombre}' creada con {n:,} puntos generados. Revísala y "
@@ -2021,9 +2142,9 @@ class MainWindow(QMainWindow):
         self._lasso_mask = None
         self.viewer.clear_preview()
         self.viewer.show_layers(stack)
-        dock = self._ensure_crop_dock()
+        dock = self._ensure_layer_dock()
         dock.refresh_layers(stack)
-        dock.set_restore_available(True)
+        dock.set_restore_enabled(True)
         self.show_status(f"Capa '{capa.name}' eliminada (puedes restaurarla).")
 
     def _on_layer_restore(self) -> None:
@@ -2035,9 +2156,9 @@ class MainWindow(QMainWindow):
         stack.insert_layer(i, capa)
         self._removed_layer_backup = None
         self.viewer.show_layers(stack)
-        dock = self._ensure_crop_dock()
+        dock = self._ensure_layer_dock()
         dock.refresh_layers(stack)
-        dock.set_restore_available(False)
+        dock.set_restore_enabled(False)
         self.show_status(f"Capa '{capa.name}' restaurada.")
 
     def _on_export_visible(self) -> None:

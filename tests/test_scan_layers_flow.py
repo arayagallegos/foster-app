@@ -83,7 +83,7 @@ def test_on_load_lidar_enruta_segun_scans(app, qtbot, monkeypatch):
     monkeypatch.setattr(w, "_cargar_scans_por_capas",
                         lambda p: llamadas.__setitem__("scans", llamadas["scans"] + 1))
     monkeypatch.setattr(w, "_cargar_nube_unica",
-                        lambda p, t: llamadas.__setitem__("unica", llamadas["unica"] + 1))
+                        lambda p: llamadas.__setitem__("unica", llamadas["unica"] + 1))
 
     # .e57 con 5 scans → capas
     monkeypatch.setattr(w, "_open_file_dialog", lambda *a, **k: "X.e57")
