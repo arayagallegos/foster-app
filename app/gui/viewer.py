@@ -67,6 +67,7 @@ class Viewer3D(QWidget):
         self._camara_encuadrada = False   # se encuadra una vez, al cargar
         # apagada por defecto: la órbita es lo que se espera al abrir un visor
         self.wasd_activo = False
+        self.arrastre_desplaza = True
         self._look_habilitado = False   # mirar con botón derecho
         self._mirando = False           # botón derecho apretado ahora
         self._cursor_origen = None
@@ -92,6 +93,9 @@ class Viewer3D(QWidget):
 
         layout.addWidget(self.plotter.interactor)
         self._instalar_wasd()
+        # Arrastrar desplaza en vez de girar: es lo que espera quien viene de
+        # RealityScan, y evita perder la orientación por un arrastre accidental.
+        self.set_arrastre_desplaza(True)
 
     # ------------------------------------------------------------------ #
     # Carga de nubes de puntos                                             #
@@ -273,6 +277,29 @@ class Viewer3D(QWidget):
 
     SENS_MOUSE = 0.0035        # radianes por píxel de movimiento
 
+    def set_arrastre_desplaza(self, activo: bool) -> None:
+        """Arrastrar con el botón izquierdo DESPLAZA la nube en vez de girarla.
+
+        Por defecto VTK gira con el izquierdo. Al inspeccionar una nube el gesto
+        más frecuente no es girar sino recorrerla, y girar por accidente
+        desorienta: se pierde de vista qué parte de la estructura se miraba. Es
+        el comportamiento de RealityScan, la herramienta que el laboratorio usa.
+
+        Se implementa con `enable_custom_trackball_style` de PyVista y no
+        subclasando el estilo de VTK: los métodos virtuales de una subclase de
+        Python no se invocan cuando la llamada viene del lado C++, de modo que
+        una subclase queda sin efecto.
+        """
+        self.arrastre_desplaza = bool(activo)
+        if activo:
+            self.plotter.enable_custom_trackball_style(
+                left="pan", right="rotate", middle="pan",
+                shift_left="rotate",     # atajo para girar sin soltar el ratón
+            )
+        else:
+            self.plotter.enable_trackball_style()
+        self.plotter.render()
+
     def set_mouse_look(self, activo: bool) -> None:
         """Habilita mirar en primera persona MIENTRAS se mantiene el botón derecho.
 
@@ -443,17 +470,41 @@ class Viewer3D(QWidget):
     def reset_camera(self):
         self.plotter.reset_camera()
 
+    # (clave, etiqueta, método de PyVista, negativo). Las seis caras del cubo
+    # más la isométrica: en una estructura de revolución, mirar desde un lado u
+    # otro cambia por completo qué queda ocluido.
+    VISTAS = (
+        ("isometrica", "Isométrica", "view_isometric", False),
+        ("planta",     "Planta (arriba)", "view_xy", False),
+        ("inferior",   "Inferior (abajo)", "view_xy", True),
+        ("frente",     "Frente (−Y)", "view_xz", False),
+        ("atras",      "Atrás (+Y)", "view_xz", True),
+        ("derecha",    "Derecha (+X)", "view_yz", False),
+        ("izquierda",  "Izquierda (−X)", "view_yz", True),
+    )
+
+    def set_view(self, clave: str) -> None:
+        """Coloca la cámara en una de las vistas canónicas."""
+        for c, _etq, metodo, negativo in self.VISTAS:
+            if c != clave:
+                continue
+            fn = getattr(self.plotter, metodo)
+            fn() if metodo == "view_isometric" else fn(negative=negativo)
+            return
+        raise ValueError(f"Vista desconocida: {clave!r}")
+
+    # Compatibilidad con el código existente
     def set_view_top(self):
-        self.plotter.view_xy()
+        self.set_view("planta")
 
     def set_view_front(self):
-        self.plotter.view_xz()
+        self.set_view("frente")
 
     def set_view_side(self):
-        self.plotter.view_yz()
+        self.set_view("derecha")
 
     def set_view_isometric(self):
-        self.plotter.view_isometric()
+        self.set_view("isometrica")
 
     def toggle_axes(self, visible: bool):
         if visible:
