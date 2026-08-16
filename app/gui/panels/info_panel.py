@@ -1,32 +1,48 @@
 """
-info_panel.py — Panel lateral con información de la nube de puntos activa.
+info_panel.py — Panel lateral con información de la nube cargada.
 
-Muestra: nombre del archivo, cantidad de puntos, dimensiones del bounding box,
-presencia de color RGB, y estado del proyecto.
+Muestra solo lo que condiciona decisiones del usuario: cuántos puntos hay, de
+cuántos escaneos vienen, cuánto ocupa el archivo, qué tamaño tiene la escena y
+cuál es el espaciado entre puntos.
+
+El espaciado es el dato menos evidente y el más útil: de él dependen el vóxel
+del caché, el `eps` de la agrupación por densidad y la tolerancia de las
+primitivas. Antes había que deducirlo probando.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QGroupBox,
-    QSizePolicy, QFrame
-)
+import numpy as np
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont
+from PyQt6.QtWidgets import (
+    QFrame, QGroupBox, QLabel, QVBoxLayout, QWidget,
+)
 
-from app.core.project import Project, CloudInfo
+from app.core.project import CloudInfo, Project
+
+
+def _texto_tamano(n_bytes: int) -> str:
+    for unidad in ("B", "KB", "MB", "GB"):
+        if n_bytes < 1024 or unidad == "GB":
+            return f"{n_bytes:.1f} {unidad}" if unidad != "B" else f"{n_bytes} B"
+        n_bytes /= 1024.0
+    return f"{n_bytes:.1f} GB"
 
 
 class InfoPanel(QWidget):
-    """
-    Panel lateral derecho con información de la nube y estado del proyecto.
-    """
+    """Panel lateral con los datos de la nube activa."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumWidth(220)
         self.setMaximumWidth(280)
+        self._n_escaneos: Optional[int] = None
+        self._espaciado: Optional[float] = None
+        self._en_cache: Optional[int] = None
         self._setup_ui()
 
     def _setup_ui(self):
@@ -35,94 +51,86 @@ class InfoPanel(QWidget):
         layout.setSpacing(8)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        # --- Título ---
-        title = QLabel("Información")
-        font = QFont()
-        font.setBold(True)
-        font.setPointSize(10)
-        title.setFont(font)
-        layout.addWidget(title)
+        titulo = QLabel("Información")
+        fuente = QFont()
+        fuente.setBold(True)
+        fuente.setPointSize(10)
+        titulo.setFont(fuente)
+        layout.addWidget(titulo)
 
-        line = QFrame()
-        line.setFrameShape(QFrame.Shape.HLine)
-        line.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(line)
+        linea = QFrame()
+        linea.setFrameShape(QFrame.Shape.HLine)
+        linea.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(linea)
 
-        # --- Grupo: Nube LiDAR ---
-        self._lidar_group = QGroupBox("Nube LiDAR")
-        self._lidar_layout = QVBoxLayout(self._lidar_group)
-        self._lidar_label = _make_info_label("Sin cargar")
-        self._lidar_layout.addWidget(self._lidar_label)
-        layout.addWidget(self._lidar_group)
+        self._grupo = QGroupBox("Nube de puntos")
+        caja = QVBoxLayout(self._grupo)
+        self._etiqueta = QLabel("Sin cargar")
+        self._etiqueta.setWordWrap(True)
+        self._etiqueta.setTextFormat(Qt.TextFormat.RichText)
+        self._etiqueta.setStyleSheet("color: #cccccc; font-size: 11px;")
+        caja.addWidget(self._etiqueta)
+        layout.addWidget(self._grupo)
 
-        # --- Grupo: Nube Fotogrametría ---
-        self._photo_group = QGroupBox("Fotogrametría")
-        self._photo_layout = QVBoxLayout(self._photo_group)
-        self._photo_label = _make_info_label("Sin cargar")
-        self._photo_layout.addWidget(self._photo_label)
-        layout.addWidget(self._photo_group)
+        self._grupo_vista = QGroupBox("En pantalla")
+        caja_vista = QVBoxLayout(self._grupo_vista)
+        self._etiqueta_vista = QLabel("—")
+        self._etiqueta_vista.setWordWrap(True)
+        self._etiqueta_vista.setStyleSheet("color: #cccccc; font-size: 11px;")
+        caja_vista.addWidget(self._etiqueta_vista)
+        layout.addWidget(self._grupo_vista)
 
-        # --- Grupo: Nube Fusionada ---
-        self._fused_group = QGroupBox("Nube Fusionada")
-        self._fused_layout = QVBoxLayout(self._fused_group)
-        self._fused_label = _make_info_label("No generada")
-        self._fused_layout.addWidget(self._fused_label)
-        layout.addWidget(self._fused_group)
-
-        # Espaciador al fondo
-        layout.addStretch()
+        layout.addStretch(1)
 
     # ------------------------------------------------------------------ #
-    # Métodos de actualización                                             #
+    # API                                                                #
     # ------------------------------------------------------------------ #
 
-    def update_from_project(self, project: Project):
-        """Actualiza el panel con el estado actual del proyecto."""
-        self._update_cloud_label(self._lidar_label, project.lidar_info)
-        self._update_cloud_label(self._photo_label, project.photo_info)
-        self._update_cloud_label(self._fused_label, project.fused_info)
+    def set_scan_count(self, n: Optional[int]) -> None:
+        """Nº de escaneos del archivo. None si no aplica (un `.ply` suelto)."""
+        self._n_escaneos = n
 
-    def update_display_count(self, n_original: int, n_displayed: int):
-        """
-        Actualiza el conteo de puntos mostrados en pantalla.
-        Llamado por el viewer cuando hace downsample.
-        """
-        if n_original != n_displayed:
-            extra = f"\nMostrando: {n_displayed:,} (reducido para visualización)"
-        else:
-            extra = ""
-        # Este método se puede refinar para saber cuál nube actualizar
-        # Por ahora solo agrega info al label de la última nube cargada
-        _ = extra  # usado en versiones futuras
+    def set_puntos_en_cache(self, n: Optional[int]) -> None:
+        """Puntos que quedaron tras voxelizar. Se muestra aparte del total del
+        archivo: confundirlos da una idea equivocada del dato de partida."""
+        self._en_cache = n
 
-    def _update_cloud_label(self, label: QLabel, info: Optional[CloudInfo]):
-        if info is None:
-            label.setText("Sin cargar")
-            label.setStyleSheet("color: #888888;")
+    def set_espaciado(self, espaciado: Optional[float]) -> None:
+        """Distancia típica entre puntos vecinos, en metros."""
+        self._espaciado = espaciado
+
+    def update_from_project(self, project: Project) -> None:
+        self._etiqueta.setText(self._describir(project.lidar_info))
+
+    def update_display_count(self, n_original: int, n_displayed: int) -> None:
+        if n_original <= 0:
+            self._etiqueta_vista.setText("—")
             return
+        pct = 100.0 * n_displayed / n_original
+        self._etiqueta_vista.setText(
+            f"{n_displayed:,} de {n_original:,} puntos ({pct:.0f} %)")
 
+    # ------------------------------------------------------------------ #
+
+    def _describir(self, info: Optional[CloudInfo]) -> str:
+        if info is None:
+            return "Sin cargar"
+
+        filas = [f"<b>{Path(info.path).name if info.path else info.name}</b>"]
+        filas.append(f"Puntos del archivo: {info.n_points_original:,}")
+        if self._en_cache and self._en_cache != info.n_points_original:
+            pct = 100.0 * self._en_cache / max(info.n_points_original, 1)
+            filas.append(f"En el caché: {self._en_cache:,} ({pct:.1f} %)")
+        if self._n_escaneos:
+            filas.append(f"Escaneos: {self._n_escaneos}")
+        try:
+            if info.path and Path(info.path).exists():
+                filas.append(f"Archivo: {_texto_tamano(Path(info.path).stat().st_size)}")
+        except OSError:
+            pass
         d = info.dimensions
-        text = (
-            f"<b>{info.name}</b><br>"
-            f"Puntos: {info.n_points_original:,}<br>"
-            f"Dim: {d[0]:.1f} × {d[1]:.1f} × {d[2]:.1f} m<br>"
-            f"RGB: {'✓' if info.has_colors else '✗ (altura)'}"
-        )
-        label.setText(text)
-        label.setStyleSheet("color: #dddddd;")
-
-
-# ------------------------------------------------------------------ #
-# Helpers                                                              #
-# ------------------------------------------------------------------ #
-
-def _make_info_label(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setWordWrap(True)
-    label.setTextFormat(Qt.TextFormat.RichText)
-    label.setStyleSheet("color: #888888; padding: 2px;")
-    label.setSizePolicy(
-        QSizePolicy.Policy.Preferred,
-        QSizePolicy.Policy.Minimum
-    )
-    return label
+        filas.append(f"Dimensiones: {d[0]:.1f} × {d[1]:.1f} × {d[2]:.1f} m")
+        if self._espaciado:
+            filas.append(f"Espaciado: {self._espaciado:.3f} m")
+        filas.append("Color RGB: " + ("sí" if info.has_colors else "no"))
+        return "<br>".join(filas)
