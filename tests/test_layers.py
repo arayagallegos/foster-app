@@ -403,3 +403,44 @@ def test_unir_con_indice_inexistente():
     s = _stack_de_prueba()
     with pytest.raises(IndexError):
         s.unir([0, 99], "X")
+
+
+# ---------- visibilidad en bloque ---------- #
+
+def test_mostrar_solo_aisla_las_capas_indicadas():
+    """Aislar una capa entre 35 exige 34 clics si se hace de a una."""
+    s = _stack_de_prueba()
+    s.mostrar_solo([1])
+    assert [c.visible for c in s.layers] == [False, True, False, False]
+
+
+def test_mostrar_solo_admite_varias():
+    s = _stack_de_prueba()
+    s.mostrar_solo([0, 3])
+    assert [c.visible for c in s.layers] == [True, False, False, True]
+
+
+def test_mostrar_solo_valida_la_entrada():
+    s = _stack_de_prueba()
+    with pytest.raises(ValueError):
+        s.mostrar_solo([])
+    with pytest.raises(IndexError):
+        s.mostrar_solo([99])
+
+
+def test_set_visibles_cambia_varias_de_una_vez():
+    s = _stack_de_prueba()
+    s.set_visibles([0, 2], False)
+    assert [c.visible for c in s.layers] == [False, True, False, False]
+    s.set_visibles([0, 3], True)
+    assert [c.visible for c in s.layers] == [True, True, False, True]
+
+
+def test_invertir_visibilidad_da_el_complemento():
+    """El atajo para pasar de mirar los scans exteriores a los interiores."""
+    s = _stack_de_prueba()
+    antes = [c.visible for c in s.layers]
+    s.invertir_visibilidad()
+    assert [c.visible for c in s.layers] == [not v for v in antes]
+    s.invertir_visibilidad()
+    assert [c.visible for c in s.layers] == antes

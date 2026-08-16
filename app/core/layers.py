@@ -272,6 +272,36 @@ class LayerStack:
             raise IndexError(f"No existe la capa {i}.")
         self.layers[i].name = nombre
 
+    def mostrar_solo(self, indices) -> None:
+        """Deja visibles únicamente las capas indicadas.
+
+        Con 35 capas-scan, aislar una es la operación más frecuente y hacerlo a
+        mano exige 34 clics.
+        """
+        indices = {int(i) for i in indices}
+        if not indices:
+            raise ValueError("Hay que indicar al menos una capa.")
+        if not all(0 <= i < len(self.layers) for i in indices):
+            raise IndexError("Alguna de las capas indicadas no existe.")
+        for i, capa in enumerate(self.layers):
+            capa.visible = i in indices
+
+    def set_visibles(self, indices, visible: bool) -> None:
+        """Cambia la visibilidad de varias capas de una vez."""
+        for i in indices:
+            if not 0 <= int(i) < len(self.layers):
+                raise IndexError(f"No existe la capa {i}.")
+            self.layers[int(i)].visible = bool(visible)
+
+    def invertir_visibilidad(self) -> None:
+        """Muestra lo oculto y oculta lo visible.
+
+        Es el atajo natural cuando se quiere el complemento de lo elegido: por
+        ejemplo, pasar de mirar los scans exteriores a mirar los interiores.
+        """
+        for capa in self.layers:
+            capa.visible = not capa.visible
+
     def set_visible(self, i: int, visible: bool) -> None:
         self.layers[i].visible = bool(visible)
 
