@@ -3,7 +3,7 @@ main_window.py — Ventana principal de Foster App.
 
 Layout:
   ┌──────────────────────────────────────────────────┐
-  │  Toolbar (cargar LiDAR, cargar foto, limpiar...) │
+  │  Toolbar (cargar nube, vistas, recortar, segmentar)│
   ├───────────────────────┬──────────────────────────┤
   │                       │                          │
   │    Viewer 3D          │   Panel de información   │
@@ -22,15 +22,15 @@ import numpy as np
 import open3d as o3d
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout,
-    QSplitter, QToolBar, QStatusBar,
-    QProgressBar, QLabel, QFileDialog,
+    QToolBar, QStatusBar,
+    QProgressBar, QLabel, QFileDialog, QDockWidget,
     QMessageBox, QApplication, QInputDialog,
     QMenu, QToolButton, QSlider, QVBoxLayout, QWidgetAction,
 )
 from PyQt6.QtCore import Qt, QSettings
 from PyQt6.QtGui import QAction, QActionGroup, QKeySequence
 
-from app.core.layers import LayerStack
+from app.core.layers import LayerStack, _slug
 from app.core.project import Project
 from app.core.workers import LoadWorker
 from app.gui.viewer import Viewer3D
@@ -116,6 +116,9 @@ class MainWindow(QMainWindow):
         self._db_etiquetas_filtradas = None
         self._db_seleccion: list[int] = []
         self._db_umbral: int = 0
+        # Estado de la reconstrucción
+        self._malla = None
+        self._malla_worker = None
         # Estado de la reparación por simetría
         self._si_plano = None
         self._si_relleno = None
@@ -130,7 +133,7 @@ class MainWindow(QMainWindow):
         self._setup_statusbar()
         self._apply_stylesheet()
 
-        self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — Sin título")
+        self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} · Sin título")
         self.show_status("Listo. Carga una nube de puntos para comenzar.")
 
     # ------------------------------------------------------------------ #
@@ -150,8 +153,8 @@ class MainWindow(QMainWindow):
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
 
-        # --- Cargar LiDAR ---
-        self._act_load_lidar = QAction("Cargar LiDAR", self)
+        # --- Cargar nube ---
+        self._act_load_lidar = QAction("Cargar nube de puntos", self)
         self._act_load_lidar.setShortcut(QKeySequence("Ctrl+L"))
         self._act_load_lidar.setToolTip(
             "Cargar nube de puntos LiDAR (.e57, .las, .laz, .ply)\n"
@@ -176,6 +179,7 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        tb.addWidget(self._menu_paneles())
         tb.addWidget(self._menu_vistas())
         tb.addWidget(self._menu_camara())
         tb.addWidget(self._menu_visibilidad())
@@ -233,6 +237,7 @@ class MainWindow(QMainWindow):
         self._act_tool_cono = _accion("Cono", "cono")
         self._act_tool_dbscan = _accion("Agrupar (DBSCAN)", "dbscan")
         self._act_tool_simetria = _accion("Reparar por simetría", "simetria")
+        self._act_tool_malla = _accion("Mallar", "malla")
         for act in (self._act_tool_esfera, self._act_tool_plano,
                     self._act_tool_cilindro, self._act_tool_cono):
             menu_seg.addAction(act)
@@ -242,10 +247,25 @@ class MainWindow(QMainWindow):
         self._btn_seg.setMenu(menu_seg)
         tb.addWidget(self._btn_seg)
 
+        # Mallar tiene botón propio y no vive dentro de Segmentar: no extrae
+        # ninguna entidad, sino que convierte una ya extraída en superficie. Es
+        # el paso siguiente del flujo, no una variante del anterior.
+        self._btn_malla = QToolButton()
+        self._btn_malla.setText("Mallar")
+        self._btn_malla.setToolTip(
+            "Convierte la entidad en superficie triangulada exportable.\n"
+            "Último paso: sobre una entidad ya segmentada y reparada.")
+        self._btn_malla.setDefaultAction(self._act_tool_malla)
+        # Con una acción por defecto, el botón hereda su estado: habilitarlo o
+        # no se decide en la acción, no en el botón.
+        self._act_tool_malla.setEnabled(False)
+        tb.addWidget(self._btn_malla)
+
         self._acts_tool = (self._act_tool_caja, self._act_tool_lazo,
                            self._act_tool_esfera, self._act_tool_plano,
                            self._act_tool_cilindro, self._act_tool_cono,
-                           self._act_tool_dbscan, self._act_tool_simetria)
+                           self._act_tool_dbscan, self._act_tool_simetria,
+                           self._act_tool_malla)
 
         tb.addSeparator()
 
@@ -256,9 +276,10 @@ class MainWindow(QMainWindow):
         tb.addAction(act_clear)
 
     def _habilitar_herramientas(self, activo: bool) -> None:
-        """Recortar y Segmentar dependen de lo mismo: que haya nube cargada."""
+        """Los tres dependen de lo mismo: que haya nube cargada."""
         self._btn_crop.setEnabled(bool(activo))
         self._btn_seg.setEnabled(bool(activo))
+        self._act_tool_malla.setEnabled(bool(activo))
 
     @staticmethod
     def _nota(menu: QMenu, texto: str) -> None:
@@ -276,6 +297,43 @@ class MainWindow(QMainWindow):
         accion = QWidgetAction(menu)
         accion.setDefaultWidget(etiqueta)
         menu.addAction(accion)
+
+    def _menu_paneles(self) -> QToolButton:
+        """Vuelve a abrir un panel cerrado con su X.
+
+        Sin esto, cerrar el dock de capas lo perdía para toda la sesión: los
+        docks son cerrables y no había ningún sitio desde donde recuperarlos.
+        El menú se puebla al desplegarse porque los docks se crean tarde —el de
+        herramienta, solo cuando se usa una.
+        """
+        btn = QToolButton()
+        btn.setText("Paneles")
+        btn.setToolTip("Muestra u oculta los paneles laterales.")
+        btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(btn)
+        menu.aboutToShow.connect(lambda: self._poblar_menu_paneles(menu))
+        btn.setMenu(menu)
+        return btn
+
+    def _poblar_menu_paneles(self, menu: QMenu) -> None:
+        menu.clear()
+        self._nota(menu, "Cerrar un panel con su X no lo destruye: se vuelve a "
+                         "abrir desde aquí, con su contenido intacto.")
+        hay = False
+        for atributo, etiqueta in (("_info_dock", "Información"),
+                                   ("_layer_dock", "Capas"),
+                                   ("_crop_dock", "Herramienta")):
+            dock = getattr(self, atributo, None)
+            if dock is None:        # no se crea aquí: crearlo sería mostrarlo
+                continue
+            act = dock.toggleViewAction()
+            act.setText(etiqueta)
+            menu.addAction(act)
+            hay = True
+        if not hay:
+            act = QAction("(no hay paneles todavía)", self)
+            act.setEnabled(False)
+            menu.addAction(act)
 
     def _menu_vistas(self) -> QToolButton:
         """Menú Vista: las seis caras del cubo más la isométrica.
@@ -418,26 +476,23 @@ class MainWindow(QMainWindow):
         self.viewer.set_tamano_punto(float(v))
 
     def _setup_central(self):
-        """Crea el layout central: viewer + panel de info en un splitter."""
-        central = QWidget()
-        self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
-        layout.setContentsMargins(0, 0, 0, 0)
+        """El visor ocupa el centro; la información va en un dock lateral.
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-
-        # Viewer 3D (toma la mayor parte del espacio)
+        Estaba incrustada en un divisor junto al visor, y por eso era el único
+        panel que no se podía cerrar ni recuperar: los divisores no tienen botón
+        de cierre y el menú Paneles solo conoce docks. Como dock se comporta
+        igual que Capas y Herramienta, que es lo que el usuario espera al ver
+        tres paneles iguales en pantalla.
+        """
         self.viewer = Viewer3D(self)
         self.viewer.points_displayed.connect(self._on_points_displayed)
-        splitter.addWidget(self.viewer)
+        self.setCentralWidget(self.viewer)
 
-        # Panel de información
         self.info_panel = InfoPanel(self)
-        splitter.addWidget(self.info_panel)
-
-        # El viewer ocupa ~80% del ancho
-        splitter.setSizes([1000, 250])
-        layout.addWidget(splitter)
+        self._info_dock = QDockWidget("Información", self)
+        self._info_dock.setObjectName("info_dock")
+        self._info_dock.setWidget(self.info_panel)
+        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self._info_dock)
 
     def _setup_statusbar(self):
         self.statusbar = QStatusBar()
@@ -511,9 +566,6 @@ class MainWindow(QMainWindow):
                 background-color: #2e75b6;
                 border-radius: 2px;
             }
-            QSplitter::handle {
-                background-color: #444444;
-            }
             QPushButton {
                 background-color: #3c3c3c;
                 border: 1px solid #555555;
@@ -555,15 +607,43 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
 
     def _on_load_lidar(self):
-        """Carga LiDAR: un .e57 con varios scans se abre como capas por scan;
+        """Carga una nube: un .e57 con varios scans se abre como capas por scan;
         cualquier otro archivo (o .e57 de un scan) como nube única."""
-        path = self._open_file_dialog("Cargar nube LiDAR")
+        path = self._open_file_dialog("Cargar nube de puntos")
         if not path:
+            return
+        if not self._confirmar_si_es_malla(path):
             return
         if _e57_scan_count_safe(path) >= 2:
             self._cargar_scans_por_capas(path)
         else:
             self._cargar_nube_unica(path)
+
+    def _confirmar_si_es_malla(self, path: str) -> bool:
+        """Avisa si el archivo trae una malla, porque solo se cargan sus vértices.
+
+        Sin este aviso la pérdida es silenciosa. El diálogo de apertura acepta
+        `.ply`, y si el archivo contiene una malla exportada por la propia
+        herramienta el visor muestra una nube dispersa de vértices sin que nada
+        indique que la superficie se quedó fuera.
+        """
+        from app.core.io import caras_en_ply
+
+        caras, vertices = caras_en_ply(path)
+        if caras <= 0:
+            return True
+        respuesta = QMessageBox.question(
+            self,
+            "El archivo contiene una malla",
+            f"'{Path(path).name}' declara {caras:,} caras y {vertices:,} "
+            "vértices.\n\n"
+            "Esta herramienta trabaja con nubes de puntos, así que cargará "
+            "únicamente los vértices y descartará la superficie.\n\n"
+            "¿Quieres continuar?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        return respuesta == QMessageBox.StandardButton.Yes
 
     def _cargar_nube_unica(self, path: str) -> None:
         self._load_cloud(path)
@@ -602,8 +682,8 @@ class MainWindow(QMainWindow):
         self._set_loading(False)
         stack = LayerStack()
         stack.layers = [
-            CloudLayer(name=f"Scan {s.index:02d} ({s.n_pts_fino:,} pts)",
-                       pcd=s.pcd_grueso, fine_path=s.fine_path)
+            CloudLayer(name=f"Scan {s.index:02d}", pcd=s.pcd_grueso,
+                       fine_path=s.fine_path, n_pts_archivo=s.n_pts_fino)
             for s in scans
         ]
         stack.active_index = 0
@@ -611,11 +691,11 @@ class MainWindow(QMainWindow):
         # El panel de información solo se actualizaba en la carga de nube única;
         # con la carga por capas —que es el camino habitual— quedaba en blanco.
         self._actualizar_info_de_capas(scans)
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         # Solo el dock de capas: el de herramientas aparece al activar una.
         self._ensure_layer_dock().refresh_layers(stack)
         self._habilitar_herramientas(True)
-        self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — scans")
+        self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} · scans")
         self.show_status(f"{len(scans)} scans cargados como capas. "
                          "Apaga los interiores y usa 'Exportar visibles'.")
 
@@ -640,7 +720,6 @@ class MainWindow(QMainWindow):
         self.info_panel.set_puntos_en_cache(en_cache)
         self.info_panel.set_espaciado(self._espaciado_de(scans[0].pcd_grueso))
         self.info_panel.update_from_project(self.project)
-        self.info_panel.update_display_count(en_cache, len(pts))
 
     def _on_clear(self):
         """Limpia la escena y reinicia el proyecto."""
@@ -661,7 +740,7 @@ class MainWindow(QMainWindow):
             self.info_panel.update_from_project(self.project)
             self._points_label.setText("")
             self._habilitar_herramientas(False)
-            self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} — Sin título")
+            self.setWindowTitle(f"{self.APP_NAME} v{self.VERSION} · Sin título")
             self.show_status("Escena limpiada.")
 
     def _open_file_dialog(self, title: str) -> str:
@@ -707,12 +786,24 @@ class MainWindow(QMainWindow):
         self.info_panel.set_espaciado(self._espaciado_de(pcd))
         self.info_panel.update_from_project(self.project)
         self.setWindowTitle(
-            f"{self.APP_NAME} v{self.VERSION} — {self.project.name}"
+            f"{self.APP_NAME} v{self.VERSION} · {self.project.name}"
         )
         self.show_status(f"Cargado: {path}")
         self._habilitar_herramientas(True)
-        # Nube nueva: el stack de capas se reconstruye al activar una herramienta
-        self._layer_stack = None
+
+        # El stack se crea AL CARGAR y no al activar la primera herramienta.
+        # Aplazarlo tenía dos efectos visibles: el panel de capas no aparecía
+        # hasta abrir una herramienta, y el resumen "En pantalla" seguía diciendo
+        # que no había nube con la nube delante, porque se calcula desde el
+        # stack. Una nube suelta es una capa como cualquier otra.
+        stack = LayerStack()
+        stack.reset(pcd, name=Path(path).stem or "Original")
+        self._layer_stack = stack
+        dock = self._ensure_layer_dock()
+        dock.refresh_layers(stack)
+        dock.show()
+        self._repartir_docks()
+        self._redibujar_capas(stack)
 
     def _on_load_error(self, message: str):
         """Callback cuando la carga falla."""
@@ -759,8 +850,11 @@ class MainWindow(QMainWindow):
         if self._layer_dock is None:
             dock = LayerDock(self)
             dock.layer_visibility_changed.connect(self._on_layer_visibility)
-            dock.layer_activated.connect(self._on_layer_activated)
+            # El conjunto activo lo dice la columna 'Usar', no la selección.
+            dock.layers_activated.connect(self._on_layers_activated)
+            dock.activate_visible_requested.connect(self._on_activate_visible)
             dock.layer_removed.connect(self._on_layer_removed)
+            dock.layers_removed.connect(self._on_layers_removed)
             dock.layer_renamed.connect(self._on_layer_renamed)
             dock.layer_restore_requested.connect(self._on_layer_restore)
             dock.layers_merge_requested.connect(self._on_layers_merge)
@@ -814,6 +908,9 @@ class MainWindow(QMainWindow):
             dock.dbscan_eliminar.connect(self._on_dbscan_eliminar)
             dock.simetria_params_changed.connect(self._on_simetria_params)
             dock.simetria_refinar.connect(self._on_simetria_refinar)
+            dock.malla_generar.connect(self._on_malla_generar)
+            dock.malla_exportar.connect(self._on_malla_exportar)
+            dock.malla_vista_changed.connect(self._on_malla_vista)
             dock.simetria_aplicar.connect(self._on_simetria_aplicar)
             self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
             # Crear NO es mostrar: varias operaciones sobre capas necesitan el
@@ -828,13 +925,18 @@ class MainWindow(QMainWindow):
         """Asegura que exista un stack de capas. Si ya hay uno (p. ej. cargado por
         scans), lo usa; si no, lo crea desde la nube única del project."""
         if self._layer_stack is not None:
+            if not self._layer_stack.active_indices:
+                self.show_status(
+                    "Ninguna capa en uso: marca al menos una en la columna "
+                    "'Usar' para elegir sobre qué trabaja la herramienta.")
+                return False
             return True
         source = self.project.fused_cloud or self.project.lidar_cloud
         if source is None:
             return False
         self._layer_stack = LayerStack()
         self._layer_stack.reset(source)
-        self.viewer.show_layers(self._layer_stack)
+        self._redibujar_capas(self._layer_stack)
         return True
 
     def _on_tool_action(self) -> None:
@@ -929,6 +1031,15 @@ class MainWindow(QMainWindow):
                 "Coloca el plano de simetria mas o menos donde va y pulsa "
                 "'Refinar plano'. La concordancia dice si la simetria existe."
             )
+        elif tool == "malla":
+            self._malla = None
+            dock.set_malla_resultado(None)
+            self._mostrar_referencia_malla()
+            self.show_status(
+                "Marca en 'Usar' la entidad que quieras mallar y pulsa "
+                "'Generar malla'. El limite de perimetro viene propuesto a "
+                "partir del espaciado de la nube."
+            )
         else:
             self.show_status(
                 "Elige la operacion y pulsa 'Iniciar lazo' en el panel Recorte."
@@ -943,6 +1054,7 @@ class MainWindow(QMainWindow):
         self.viewer.stop_plane_widget()
         self.viewer.stop_line_widget()
         self.viewer.ocultar_fantasma_cono()
+        self.viewer.ocultar_malla()   # devuelve las capas a la vista
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         self._lasso_mask = None
@@ -999,9 +1111,10 @@ class MainWindow(QMainWindow):
         stack = self._layer_stack
         if stack is None or keep_mask is None:
             return
-        fuente_nombre = stack.active.name
+        n_activas = len(stack.active_indices)
+        fuente_nombre = stack.activas[0].name
         try:
-            recorte, descarte = stack.split_active_fino(
+            n_div, n_comp, n_sin = stack.split_activas(
                 keep_mask, self._fine_keep_fn(), self._EDITS_DIR
             )
         except ValueError as e:
@@ -1020,7 +1133,7 @@ class MainWindow(QMainWindow):
         self._lasso_ops = []
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_crop_dock()
         self._ensure_layer_dock().refresh_layers(stack)
         dock.set_lasso_active(False)
@@ -1031,11 +1144,17 @@ class MainWindow(QMainWindow):
                 stack.active.pcd, callback=self._on_crop_bounds_changed
             )
 
-        self.show_status(
-            f"'{fuente_nombre}' quedó oculta e intacta. Nueva capa activa "
-            f"'{recorte.name}' ({len(recorte.pcd.points):,} pts); "
-            f"'{descarte.name}' ({len(descarte.pcd.points):,} pts) oculta."
-        )
+        capturados = sum(len(c.pcd.points) for c in stack.activas)
+        if n_activas == 1:
+            self.show_status(
+                f"'{fuente_nombre}' quedó dividida: {capturados:,} pts "
+                f"capturados. El resto quedó oculto y marcado como descarte, "
+                "listo para restaurar si te equivocaste.")
+        else:
+            self.show_status(
+                f"{n_activas} capas activas: {n_div} divididas, {n_comp} "
+                f"capturadas enteras, {n_sin} sin aporte. {capturados:,} pts "
+                "capturados en total; cada capa conserva su nombre de origen.")
 
     def _on_fps_toggled(self, activo: bool) -> None:
         # mirar sin poder desplazarse no sirve de nada: van juntos
@@ -1094,7 +1213,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Eliminar descartes", str(e))
             return
         self._deactivate_tools()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         self._ensure_layer_dock().refresh_layers(stack)
         self.show_status(f"{n} capas de descarte eliminadas.")
 
@@ -1118,7 +1237,7 @@ class MainWindow(QMainWindow):
             return
 
         self.viewer.clear_preview()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_crop_dock()
         self._ensure_layer_dock().refresh_layers(stack)
         if self._active_tool == "caja":
@@ -1213,6 +1332,11 @@ class MainWindow(QMainWindow):
         if resp != QMessageBox.StandardButton.Yes:
             return
 
+        # Los límites se copian ANTES de desactivar las herramientas, porque
+        # `_deactivate_tools` los pone a None y el worker los recibiría vacíos.
+        min_bound = np.asarray(self._crop_min, dtype=float).copy()
+        max_bound = np.asarray(self._crop_max, dtype=float).copy()
+
         self._deactivate_tools()
         cache_dir = (Path("output/scans_cache")
                      / f"{Path(self._e57_path).stem}_fino_{voxel:.3f}")
@@ -1221,7 +1345,7 @@ class MainWindow(QMainWindow):
 
         from app.core.workers import RecacheWorker
         worker = RecacheWorker(
-            self._e57_path, cache_dir, self._crop_min, self._crop_max,
+            self._e57_path, cache_dir, min_bound, max_bound,
             voxel_fino=voxel, voxel_grueso=max(voxel * 3, 0.03), parent=self,
         )
         worker.progress.connect(self._progress.setValue)
@@ -1429,7 +1553,7 @@ class MainWindow(QMainWindow):
                 ajustar_inicial=False,
             )
             self.show_status(
-                f"Entidad capturada en '{self._layer_stack.active.name}'. "
+                f"Entidad capturada en '{self._layer_stack.activas[0].name}'. "
                 "Coloca el plano de nuevo para la siguiente."
             )
 
@@ -1625,6 +1749,7 @@ class MainWindow(QMainWindow):
         self._apply_split(self._cono_mask)
         self._cono = self._cono_base = self._cono_mask = None
         self.viewer.ocultar_fantasma_cono()
+        self.viewer.ocultar_malla()
         self.viewer.clear_preview()
         self._ensure_crop_dock().set_cono_has_selection(False)
         if self._active_tool == "cono" and self._layer_stack is not None:
@@ -1772,33 +1897,23 @@ class MainWindow(QMainWindow):
         if self._layer_stack is None or not self._db_seleccion:
             return
         stack = self._layer_stack
-        fuente = stack.active
         et = self._db_etiquetas_filtradas
         usados = mascara_de(et, self._db_seleccion)
         if not usados.any():
             self.show_status("Los clusters marcados no tienen puntos.")
             return
 
-        nuevas = []
-        for cid in self._db_seleccion:
-            m = et == cid
-            if m.any():
-                nuevas.append(CloudLayer(name=f"Cluster {cid}",
-                                         pcd=_subset(fuente.pcd, m)))
-        resto = _subset(fuente.pcd, ~usados)
-        if len(resto.points):
-            fuente.pcd = resto
-        else:
-            stack.layers.remove(fuente)
-
-        i = stack.layers.index(fuente) + 1 if fuente in stack.layers else 0
-        stack.layers[i:i] = nuevas
-        stack.active_index = i
+        try:
+            nuevas = stack.extraer_de_activas(
+                [(f"Cluster {cid}", et == cid) for cid in self._db_seleccion])
+        except ValueError as e:
+            self.show_status(str(e))
+            return
 
         self._db_etiquetas = self._db_etiquetas_filtradas = None
         self._db_seleccion = []
         self.viewer.ocultar_clusters()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_crop_dock()
         self._ensure_layer_dock().refresh_layers(stack)
         dock.refresh_clusters([])
@@ -1820,13 +1935,16 @@ class MainWindow(QMainWindow):
             self.show_status("Eso eliminaria la capa entera.")
             return
         stack = self._layer_stack
-        n = int(mask.sum())
-        stack.active.pcd = _subset(stack.active.pcd, ~mask)
+        try:
+            n = stack.eliminar_de_activas(mask)
+        except ValueError as e:
+            self.show_status(str(e))
+            return
 
         self._db_etiquetas = self._db_etiquetas_filtradas = None
         self._db_seleccion = []
         self.viewer.ocultar_clusters()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_crop_dock()
         self._ensure_layer_dock().refresh_layers(stack)
         dock.refresh_clusters([])
@@ -1837,10 +1955,11 @@ class MainWindow(QMainWindow):
     def _refrescar_visibilidad(self) -> None:
         """Redibuja tras un cambio de visibilidad en bloque."""
         stack = self._layer_stack
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         self._ensure_layer_dock().refresh_layers(stack)
         n = sum(1 for c in stack.layers if c.visible)
-        self.show_status(f"{n} de {len(stack.layers)} capas visibles.")
+        self.show_status(f"{n} de {len(stack.layers)} capas visibles. "
+                         f"{self._resumen_en_uso()}")
 
     def _on_layers_visibility(self, indices, visible: bool) -> None:
         if self._layer_stack is None:
@@ -1884,7 +2003,7 @@ class MainWindow(QMainWindow):
         except (ValueError, IndexError) as e:
             QMessageBox.warning(self, "Unir capas", str(e))
             return
-        self.viewer.show_layers(self._layer_stack)
+        self._redibujar_capas(self._layer_stack)
         self._ensure_layer_dock().refresh_layers(self._layer_stack)
         self.show_status(f"{len(indices)} capas unidas en "
                          f"'{capa.name}' ({len(capa.pcd.points):,} pts).")
@@ -1972,7 +2091,7 @@ class MainWindow(QMainWindow):
             self.show_status("No hay puntos de relleno que crear.")
             return
         stack = self._layer_stack
-        nombre = f"{stack.active.name} · relleno"
+        nombre = f"{stack.activas[0].name} · relleno"
         capa = CloudLayer(
             name=nombre,
             pcd=o3d.geometry.PointCloud(
@@ -1985,7 +2104,7 @@ class MainWindow(QMainWindow):
         n = len(self._si_relleno)
         self._si_plano = self._si_relleno = None
         self.viewer.ocultar_relleno()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_crop_dock()
         self._ensure_layer_dock().refresh_layers(stack)
         dock.set_simetria_concordancia(None)
@@ -2096,70 +2215,298 @@ class MainWindow(QMainWindow):
     def _on_layer_visibility(self, i: int, visible: bool) -> None:
         if self._layer_stack is None:
             return
-        self._layer_stack.set_visible(i, visible)
-        self.viewer.show_layers(self._layer_stack)
+        stack = self._layer_stack
+        stack.set_visible(i, visible)
+        self._redibujar_capas(stack)
+        # No se repuebla la lista —eso perdería el desplazamiento y la selección—
+        # pero el recuento sí debe seguir al estado, o queda mintiendo.
+        n = sum(1 for c in stack.layers if c.visible)
+        self.show_status(f"{n} de {len(stack.layers)} capas visibles. "
+                         f"{self._resumen_en_uso()}")
+
+    # --------------------------------------------------------------- malla
+
+    def _mostrar_referencia_malla(self) -> None:
+        """Propone el límite de perímetro a partir del espaciado de la entidad."""
+        stack = self._layer_stack
+        dock = self._ensure_crop_dock()
+        if stack is None or not stack.active_indices:
+            dock.set_malla_referencia(None)
+            return
+        pts = np.asarray(stack.active.pcd.points)
+        if len(pts) < 2:
+            dock.set_malla_referencia(None)
+            return
+        from app.modules.meshing import espaciado_medio
+        dock.set_malla_referencia(espaciado_medio(pts), len(pts))
+
+    def _on_malla_generar(self, perimetro: float, rellenar: bool,
+                          perimetro_relleno: float) -> None:
+        """Triangula las capas en uso, en un hilo aparte."""
+        stack = self._layer_stack
+        if stack is None or not stack.active_indices:
+            self.show_status("Marca en 'Usar' la entidad que quieras mallar.")
+            return
+        pts = np.asarray(stack.active.pcd.points)
+        if len(pts) < 4:
+            self.show_status("Hacen falta al menos cuatro puntos para triangular.")
+            return
+
+        from app.core.workers import MallaWorker
+        dock = self._ensure_crop_dock()
+        dock.set_malla_ocupado(True)
+        dock.set_malla_resultado("Triangulando…")
+        self.show_status(f"Generando malla de {len(pts):,} puntos…")
+        worker = MallaWorker(pts, perimetro, rellenar, perimetro_relleno,
+                             parent=self)
+        worker.finished.connect(self._on_malla_lista)
+        worker.error.connect(self._on_malla_error)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self._malla_worker = worker
+        worker.start()
+
+    def _on_malla_lista(self, malla, fidelidad, stats) -> None:
+        self._malla = malla
+        dock = self._ensure_crop_dock()
+        dock.set_malla_ocupado(False)
+
+        # La fidelidad se muestra siempre, no solo si es buena: es el dato que
+        # permite decidir si la malla sirve, y esconderlo cuando sale mal es
+        # justamente lo que haría inútil haberla medido.
+        stack = self._layer_stack
+        n_puntos = (sum(len(c.pcd.points) for c in stack.activas)
+                    if stack is not None else 0)
+        dock.set_malla_metricas(malla.n_caras, malla.n_vertices, n_puntos,
+                                fidelidad, stats)
+        self._on_malla_vista(dock.malla_vista())
+        self.show_status(
+            f"Malla generada: {malla.n_caras:,} triángulos, "
+            f"{fidelidad.invencion * 100:.2f} % de superficie inventada. "
+            "Revísala y expórtala si estás conforme.")
+
+    def _on_malla_vista(self, modo: str) -> None:
+        """Qué se dibuja tras generar: la malla, la nube o ambas.
+
+        Existe porque Advancing Front INTERPOLA los puntos: la superficie pasa
+        exactamente por cada uno, de modo que con la nube dibujada encima la
+        malla queda tapada por completo y el resultado parece idéntico a no
+        haber hecho nada.
+        """
+        malla = getattr(self, "_malla", None)
+        if malla is None:
+            return
+        if modo == "nube":
+            self.viewer.ocultar_malla()
+            return
+        # Semitransparente solo cuando conviven; sola va opaca y sombreada, que
+        # es como se juzga si la superficie es correcta.
+        self.viewer.mostrar_malla(malla.vertices, malla.caras,
+                                  opacidad=0.55 if modo == "ambas" else 1.0)
+        self.viewer.set_capas_visibles(modo == "ambas")
+
+    def _on_malla_error(self, mensaje: str) -> None:
+        self._malla = None
+        dock = self._ensure_crop_dock()
+        dock.set_malla_ocupado(False)
+        dock.set_malla_resultado(f"No se pudo generar: {mensaje}")
+        self.show_status(f"Malla: {mensaje}")
+
+    def _on_malla_exportar(self) -> None:
+        malla = getattr(self, "_malla", None)
+        if malla is None:
+            self.show_status("No hay ninguna malla generada que exportar.")
+            return
+        stack = self._layer_stack
+        base = _slug(stack.activas[0].name) if stack and stack.activas else "malla"
+        destino, _ = QFileDialog.getSaveFileName(
+            self, "Guardar malla", f"{base}.ply", "Malla PLY (*.ply)")
+        if not destino:
+            return
+        from app.modules.meshing import exportar
+        try:
+            ruta = exportar(malla, destino)
+        except Exception as ex:
+            self.show_status(f"No se pudo guardar: {ex}")
+            return
+        self.show_status(f"Malla guardada en {ruta} "
+                         f"({malla.n_caras:,} triángulos).")
+
+    def _resumen_en_uso(self) -> str:
+        """Frase para la barra de estado, válida también sin capas en uso.
+
+        El conjunto vacío es legítimo desde que 'Ninguna' actúa sobre 'Usar', y
+        los mensajes de visibilidad se emiten con o sin capas en uso: dar por
+        hecho que hay al menos una reventaba al apagar la última.
+        """
+        stack = self._layer_stack
+        if stack is None or not stack.active_indices:
+            return "Ninguna capa en uso."
+        if len(stack.active_indices) == 1:
+            return f"En uso: '{stack.activas[0].name}'."
+        return f"{len(stack.active_indices)} capas en uso."
+
+    def _redibujar_capas(self, stack=None) -> None:
+        """Redibuja y pone al día el resumen del panel.
+
+        Van juntos a propósito: el resumen se calculaba una sola vez al cargar,
+        así que el panel seguía anunciando los puntos de la carga inicial aunque
+        se apagaran todas las capas. Cualquier cambio del stack pasa por aquí.
+        """
+        stack = stack if stack is not None else self._layer_stack
+        if stack is None:
+            return
+        self.viewer.show_layers(stack)
+        self.info_panel.update_layer_summary(stack.layers, stack.activas)
+
+    def _on_activate_visible(self) -> None:
+        """'Usar' ← 'Ver': operar justo sobre lo que se está viendo.
+
+        Es el caso más frecuente, y con dos columnas independientes costaría
+        marcar una por una.
+        """
+        stack = self._layer_stack
+        if stack is None:
+            return
+        visibles = [i for i, c in enumerate(stack.layers) if c.visible]
+        if not visibles:
+            self.show_status("No hay ninguna capa visible que activar.")
+            return
+        self._on_layers_activated(visibles)
+        self._ensure_layer_dock().marcar_activas(visibles)
 
     def _on_layer_activated(self, i: int) -> None:
+        self._on_layers_activated([i])
+
+    def _on_layers_activated(self, filas: list[int]) -> None:
+        """La selección de la lista ES el conjunto de capas activas.
+
+        Puede ser más de una: si una entidad quedó repartida entre varios
+        escaneos, las herramientas deben poder tratarlos juntos. Una selección
+        vacía se ignora y se conserva la activa anterior, porque toda
+        herramienta necesita al menos una capa de la que partir.
+        """
         stack = self._layer_stack
-        if stack is None or i == stack.active_index:
+        if stack is None:
             return
-        stack.set_active(i)
+        filas = [int(f) for f in filas if 0 <= f < len(stack.layers)]
+        if filas == stack.active_indices:
+            return
+        if not filas:
+            # Vaciar el conjunto es un paso legítimo —limpiar para rearmar— pero
+            # deja a la herramienta abierta sin material, así que se cierra en
+            # vez de dejarla apuntando a nada.
+            stack.set_activas([])
+            self._ensure_layer_dock().marcar_activas([])
+            if self._active_tool is not None:
+                self._deactivate_tools(keep_checked=None)
+                self.viewer.clear_preview()
+                if self._crop_dock is not None:
+                    self._crop_dock.hide()
+            self._redibujar_capas(stack)
+            self.show_status(
+                "Ninguna capa en uso. Marca las que quieras en la columna "
+                "'Usar' para volver a trabajar.")
+            return
+        stack.set_activas(filas)
+        self._ensure_layer_dock().marcar_activas(filas)
         self._lasso_mask = None
         self.viewer.stop_lasso()
         self.viewer.clear_preview()
         dock = self._ensure_crop_dock()
         dock.set_lasso_active(False)
         dock.set_lasso_has_selection(False)
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         if self._active_tool == "caja":
             self.viewer.start_crop_widget(
                 stack.active.pcd, callback=self._on_crop_bounds_changed
             )
-        self.show_status(f"Capa activa: '{stack.active.name}'.")
+        n = len(stack.active_indices)
+        # El recuento se suma capa por capa a propósito: pedirlo a `stack.active`
+        # materializaría la unión de los puntos, y con 35 capas eso es una copia
+        # de 600 MB por cada cambio de selección. La unión se construye cuando
+        # una herramienta la necesita de verdad, no al seleccionar.
+        pts = sum(len(c.pcd.points) for c in stack.activas)
+        self.show_status(
+            f"Capa activa: '{stack.activas[0].name}' ({pts:,} pts)." if n == 1 else
+            f"{n} capas activas ({pts:,} pts). Las herramientas operan sobre todas.")
 
     def _on_layer_removed(self, i: int) -> None:
+        self._on_layers_removed([i])
+
+    def _on_layers_removed(self, filas: list[int]) -> None:
+        """Elimina TODAS las capas indicadas, que son las seleccionadas.
+
+        Borrar solo la fila actual teniendo doce marcadas no corresponde a lo
+        que el usuario ve, y es destructivo: hay que acertar a la primera.
+        """
         stack = self._layer_stack
         if stack is None:
             return
-        capa = stack.layers[i]
-        n = len(capa.pcd.points)
+        filas = sorted({int(f) for f in filas if 0 <= f < len(stack.layers)})
+        if not filas:
+            return
+        if len(filas) >= len(stack.layers):
+            self.show_status("No se pueden eliminar todas las capas: debe quedar una.")
+            return
+
+        capas = [stack.layers[i] for i in filas]
+        pts = sum(len(c.pcd.points) for c in capas)
+        if len(capas) == 1:
+            detalle = f"la capa '{capas[0].name}' ({pts:,} puntos)"
+        else:
+            nombres = ", ".join(f"'{c.name}'" for c in capas[:4])
+            if len(capas) > 4:
+                nombres += f" y {len(capas) - 4} más"
+            detalle = f"{len(capas)} capas ({pts:,} puntos):\n{nombres}"
         reply = QMessageBox.question(
             self,
-            "Eliminar capa",
-            f"¿Eliminar la capa '{capa.name}' ({n:,} puntos)?\n"
+            "Eliminar capa" if len(capas) == 1 else "Eliminar capas",
+            f"¿Eliminar {detalle}?\n"
             "Podrás deshacerlo con 'Restaurar eliminada' mientras no elimines otra.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        # De mayor a menor: borrar de atrás hacia adelante deja intactos los
+        # índices que todavía no se han usado.
         try:
-            stack.remove(i)
+            for i in reversed(filas):
+                stack.remove(i)
         except ValueError as e:
             self.show_status(str(e))
             return
-        self._removed_layer_backup = (i, capa)
+        self._removed_layer_backup = list(zip(filas, capas))
         self._lasso_mask = None
         self.viewer.clear_preview()
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_layer_dock()
         dock.refresh_layers(stack)
         dock.set_restore_enabled(True)
-        self.show_status(f"Capa '{capa.name}' eliminada (puedes restaurarla).")
+        self.show_status(
+            f"Capa '{capas[0].name}' eliminada (puedes restaurarla)."
+            if len(capas) == 1 else
+            f"{len(capas)} capas eliminadas, {pts:,} puntos "
+            "(puedes restaurarlas todas).")
 
     def _on_layer_restore(self) -> None:
         stack = self._layer_stack
         backup = getattr(self, "_removed_layer_backup", None)
         if stack is None or backup is None:
             return
-        i, capa = backup
-        stack.insert_layer(i, capa)
+        # De menor a mayor, al revés que al eliminar: cada inserción desplaza a
+        # las posteriores, así que hay que ir en orden ascendente.
+        for i, capa in sorted(backup, key=lambda x: x[0]):
+            stack.insert_layer(i, capa)
         self._removed_layer_backup = None
-        self.viewer.show_layers(stack)
+        self._redibujar_capas(stack)
         dock = self._ensure_layer_dock()
         dock.refresh_layers(stack)
         dock.set_restore_enabled(False)
-        self.show_status(f"Capa '{capa.name}' restaurada.")
+        self.show_status(
+            f"Capa '{backup[0][1].name}' restaurada." if len(backup) == 1
+            else f"{len(backup)} capas restauradas.")
 
     def _on_export_visible(self) -> None:
         """Une las capas visibles y las exporta a un único .ply."""

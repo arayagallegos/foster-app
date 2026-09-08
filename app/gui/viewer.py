@@ -1130,6 +1130,52 @@ class Viewer3D(QWidget):
                                point_size=max(self._tamano_punto, 2.0))
         self.plotter.render()
 
+    def mostrar_malla(self, vertices, caras, opacidad: float = 1.0) -> None:
+        """Dibuja la malla generada.
+
+        La opacidad la decide el llamador según lo que se esté mirando. Importa
+        porque Advancing Front INTERPOLA los puntos: la superficie pasa
+        exactamente por cada uno de ellos, de modo que si la nube se dibuja
+        encima la tapa por completo y la malla parece no haberse generado.
+        """
+        import pyvista as pv
+
+        vertices = np.asarray(vertices, dtype=float)
+        caras = np.asarray(caras, dtype=np.int64)
+        if len(caras) == 0:
+            self.ocultar_malla()
+            return
+        celdas = np.hstack(
+            [np.full((len(caras), 1), 3, np.int64), caras]).ravel()
+        # Puede no haber centro aun si no se ha cargado ninguna nube por el
+        # camino habitual; sin esto, restar None revienta.
+        centro = (self._scene_center if self._scene_center is not None
+                  else np.zeros(3))
+        poly = pv.PolyData(vertices - centro, celdas)
+        with self.camara_fija():
+            self.plotter.remove_actor("_malla", render=False)
+            self.plotter.add_mesh(poly, name="_malla", color="#d6d6d6",
+                                  opacity=float(opacidad), show_edges=False,
+                                  smooth_shading=True, lighting=True,
+                                  reset_camera=False)
+        self.plotter.render()
+
+    def ocultar_malla(self) -> None:
+        self.plotter.remove_actor("_malla", render=False)
+        self.set_capas_visibles(True)
+        self.plotter.render()
+
+    def set_capas_visibles(self, visible: bool) -> None:
+        """Apaga o enciende los actores de las capas SIN tocar el stack.
+
+        Es una ocultación de vista, no un cambio de estado: al volver de la
+        herramienta de malla, las capas siguen marcadas como estaban.
+        """
+        for nombre, actor in self.plotter.actors.items():
+            if nombre.startswith("layer_"):
+                actor.SetVisibility(bool(visible))
+        self.plotter.render()
+
     def ocultar_relleno(self) -> None:
         if "_relleno" in self.plotter.actors:
             self.plotter.remove_actor("_relleno")
@@ -1171,7 +1217,9 @@ class Viewer3D(QWidget):
                 render_points_as_spheres=True,
                 style="points",
                 name=name,
-                opacity=(self._opacidad_nube if i == stack.active_index
+                opacity=(self._opacidad_nube
+                         if i in getattr(stack, "active_indices",
+                                         [stack.active_index])
                          else self._opacidad_nube * 0.5),
                 # solo se encuadra la primera vez: tras un recorte el usuario
                 # quiere seguir mirando desde donde estaba

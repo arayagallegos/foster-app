@@ -105,3 +105,52 @@ def test_load_e57_scans_cached_e2e(tmp_path):
     e57.unlink()
     scans2 = load_e57_scans_cached(str(e57), cache, voxel_fino=0.05, voxel_grueso=0.2)
     assert len(scans2) == 2
+
+
+# ------------------------------------------------- avisar si el .ply es malla
+
+def test_caras_en_ply_distingue_malla_de_nube(tmp_path):
+    """La perdida era silenciosa: un .ply con caras se cargaba como vertices."""
+    from app.core.io import caras_en_ply
+
+    malla = o3d.geometry.TriangleMesh.create_box(1, 1, 1)
+    p_malla = tmp_path / "cubo.ply"
+    o3d.io.write_triangle_mesh(str(p_malla), malla)
+    assert caras_en_ply(p_malla) == (12, 8)
+
+    nube = o3d.geometry.PointCloud(
+        o3d.utility.Vector3dVector(np.zeros((50, 3))))
+    p_nube = tmp_path / "nube.ply"
+    o3d.io.write_point_cloud(str(p_nube), nube)
+    caras, vertices = caras_en_ply(p_nube)
+    assert caras == 0 and vertices == 50
+
+
+def test_caras_en_ply_no_se_cae_con_otros_formatos(tmp_path):
+    from app.core.io import caras_en_ply
+
+    assert caras_en_ply(tmp_path / "no_existe.ply") == (0, 0)
+    assert caras_en_ply("cualquiera.e57") == (0, 0)
+    roto = tmp_path / "roto.ply"
+    roto.write_bytes(b"\x00\x01\x02 basura binaria sin cabecera")
+    assert caras_en_ply(roto) == (0, 0)
+
+
+def test_caras_en_ply_lee_solo_la_cabecera(tmp_path):
+    """Con una malla grande, leerla entera tardaria; la cabecera es inmediata."""
+    import time
+
+    rng = np.random.default_rng(0)
+    v = rng.normal(size=(4000, 3))
+    pts = v / np.linalg.norm(v, axis=1, keepdims=True)
+    nube = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(pts))
+    malla, _ = nube.compute_convex_hull()
+    p = tmp_path / "esfera.ply"
+    o3d.io.write_triangle_mesh(str(p), malla)
+
+    from app.core.io import caras_en_ply
+    t0 = time.perf_counter()
+    caras, _vertices = caras_en_ply(p)
+    dt = time.perf_counter() - t0
+    assert caras > 1000
+    assert dt < 0.05, f"deberia ser inmediato, tardo {dt:.3f} s"

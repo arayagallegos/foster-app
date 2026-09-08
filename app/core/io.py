@@ -179,6 +179,11 @@ def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb,
     Nota: se usa `read_scan` (no `read_scan_raw`), que ya devuelve los puntos en
     coordenadas mundo con la pose del scan aplicada.
     """
+    # Se valida antes de abrir el archivo, porque leerlo entero para descubrir
+    # a mitad de camino que la caja llegó vacía cuesta minutos.
+    if bounds is not None and (bounds[0] is None or bounds[1] is None):
+        raise ValueError(
+            "Se pidió recortar por una caja pero uno de sus límites llegó vacío.")
     try:
         import pye57
     except ImportError:
@@ -212,7 +217,8 @@ def _leer_e57_a_cache(path, cache_dir, voxel_fino, voxel_grueso, progress_cb,
         # una resolución más fina.
         dentro = None
         if bounds is not None:
-            mn, mx = np.asarray(bounds[0]), np.asarray(bounds[1])
+            mn, mx = (np.asarray(bounds[0], dtype=float),
+                      np.asarray(bounds[1], dtype=float))
             dentro = np.all((xyz >= mn) & (xyz <= mx), axis=1)
             xyz = xyz[dentro]
             if len(xyz) == 0:
@@ -519,6 +525,39 @@ def _load_e57(path: str, voxel_size: float = 0.03) -> o3d.geometry.PointCloud:
 # ------------------------------------------------------------------ #
 
 SUPPORTED_EXTENSIONS = [".e57", ".las", ".laz", ".ply", ".pcd"]
+
+def caras_en_ply(path) -> tuple[int, int]:
+    """Cuántas caras y vértices declara un `.ply`, leyendo solo su cabecera.
+
+    La herramienta trabaja con nubes de puntos, y al abrir un `.ply` que contiene
+    una malla el lector se queda solo con sus vértices y descarta las caras sin
+    avisar. Saberlo de antemano permite advertirlo.
+
+    Se lee la cabecera y no el archivo, porque una malla grande tarda en cargarse
+    y aquí solo hacen falta dos números. Devuelve (0, 0) si no es un `.ply` o si
+    la cabecera no se puede interpretar.
+    """
+    ruta = Path(path)
+    if ruta.suffix.lower() != ".ply":
+        return 0, 0
+    caras = vertices = 0
+    try:
+        with open(ruta, "rb") as f:
+            for _ in range(200):          # la cabecera nunca es tan larga
+                linea = f.readline()
+                if not linea:
+                    break
+                texto = linea.decode("ascii", errors="ignore").strip().lower()
+                if texto.startswith("end_header"):
+                    break
+                if texto.startswith("element face"):
+                    caras = int(texto.split()[2])
+                elif texto.startswith("element vertex"):
+                    vertices = int(texto.split()[2])
+    except (OSError, ValueError, IndexError):
+        return 0, 0
+    return caras, vertices
+
 
 FILTER_STRING = (
     "Nubes de puntos ("

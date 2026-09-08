@@ -60,3 +60,33 @@ def test_lasso_started_emite_operacion(dock):
     assert recibido == ["difference"]
     # La explicación vive en el tooltip del radio
     assert "ROJO" in dock._lasso_op_group.buttons()[1].toolTip()
+
+
+def test_refresh_clusters_puebla_la_lista(dock):
+    """Poblar la lista de DBSCAN no depende de que se ejecute DBSCAN.
+
+    La primera versión importaba `QListWidget` pero no `QListWidgetItem`, y como
+    el único camino que construye items es este, el fallo solo aparecía al
+    terminar un agrupamiento real sobre una nube cargada.
+    """
+    from app.modules.clusters import InfoCluster
+
+    infos = [
+        InfoCluster(id=0, n_pts=1200, planaridad=0.91,
+                    extension=np.array([3.0, 2.0, 0.4]),
+                    centro=np.zeros(3)),
+        InfoCluster(id=1, n_pts=80, planaridad=0.12,
+                    extension=np.array([0.5, 0.5, 4.0]),
+                    centro=np.ones(3)),
+    ]
+    dock.refresh_clusters(infos)
+
+    assert dock._lista_clusters.count() == 2
+    assert dock._lista_clusters.item(0).data(Qt.ItemDataRole.UserRole) == 0
+    assert "1,200 pts" in dock._lista_clusters.item(0).text()
+    # Sin selección no hay nada que capturar ni eliminar
+    assert not dock._btn_db_capturar.isEnabled()
+    assert not dock._btn_db_eliminar.isEnabled()
+
+    dock.refresh_clusters([])
+    assert dock._lista_clusters.count() == 0

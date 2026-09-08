@@ -90,17 +90,17 @@ def test_flujo_lazo_preview_y_aplicar_crea_capas(app, qtbot):
     assert "_preview_keep" in plotter.actors, "no se creó el preview verde"
     assert "_preview_discard" in plotter.actors, "no se creó el preview rojo"
 
-    # Aplicar (no destructivo): Original intacta y oculta + Recorte activo
-    # + Descarte oculto
+    # Aplicar: la capa se reemplaza por sus dos mitades, que heredan su nombre.
+    # No se guarda una tercera copia de la original porque la union de las dos
+    # mitades ya es exactamente la original.
     w._on_lasso_apply()
     stack = w._layer_stack
-    assert len(stack) == 3
-    assert stack.layers[0].name == "Original" and not stack.layers[0].visible
-    assert stack.active.name == "Recorte 1" and stack.active.visible
-    assert stack.layers[2].name == "Descarte 1" and not stack.layers[2].visible
-    assert "layer_1" in plotter.actors              # el recorte activo se dibuja
-    assert "layer_0" not in plotter.actors          # ocultas no se dibujan
-    assert "layer_2" not in plotter.actors
+    assert len(stack) == 2
+    assert stack.active.name == "Original · dentro 1" and stack.active.visible
+    assert stack.layers[1].name == "Original · fuera 1"
+    assert not stack.layers[1].visible and stack.layers[1].descarte
+    assert "layer_0" in plotter.actors               # la mitad capturada se dibuja
+    assert "layer_1" not in plotter.actors           # ocultas no se dibujan
     assert "_preview_keep" not in plotter.actors    # preview limpiado
     plotter.close()
 

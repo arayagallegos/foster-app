@@ -17,9 +17,8 @@ from typing import Optional
 
 import numpy as np
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QFrame, QGroupBox, QLabel, QVBoxLayout, QWidget,
+    QGroupBox, QLabel, QVBoxLayout, QWidget,
 )
 
 from app.core.project import CloudInfo, Project
@@ -51,18 +50,6 @@ class InfoPanel(QWidget):
         layout.setSpacing(8)
         layout.setContentsMargins(8, 8, 8, 8)
 
-        titulo = QLabel("Información")
-        fuente = QFont()
-        fuente.setBold(True)
-        fuente.setPointSize(10)
-        titulo.setFont(fuente)
-        layout.addWidget(titulo)
-
-        linea = QFrame()
-        linea.setFrameShape(QFrame.Shape.HLine)
-        linea.setFrameShadow(QFrame.Shadow.Sunken)
-        layout.addWidget(linea)
-
         self._grupo = QGroupBox("Nube de puntos")
         caja = QVBoxLayout(self._grupo)
         self._etiqueta = QLabel("Sin cargar")
@@ -74,7 +61,7 @@ class InfoPanel(QWidget):
 
         self._grupo_vista = QGroupBox("En pantalla")
         caja_vista = QVBoxLayout(self._grupo_vista)
-        self._etiqueta_vista = QLabel("—")
+        self._etiqueta_vista = QLabel("Sin nube cargada")
         self._etiqueta_vista.setWordWrap(True)
         self._etiqueta_vista.setStyleSheet("color: #cccccc; font-size: 11px;")
         caja_vista.addWidget(self._etiqueta_vista)
@@ -104,11 +91,32 @@ class InfoPanel(QWidget):
 
     def update_display_count(self, n_original: int, n_displayed: int) -> None:
         if n_original <= 0:
-            self._etiqueta_vista.setText("—")
+            self._etiqueta_vista.setText("Sin nube cargada")
             return
         pct = 100.0 * n_displayed / n_original
         self._etiqueta_vista.setText(
             f"{n_displayed:,} de {n_original:,} puntos ({pct:.0f} %)")
+
+    def update_layer_summary(self, capas, activas) -> None:
+        """Resumen en vivo de las capas: cuánto se ve y cuánto se está usando.
+
+        Se recalcula en cada cambio de visibilidad o de conjunto activo. Antes se
+        fijaba una sola vez al cargar, así que el panel seguía anunciando dos
+        millones de puntos en pantalla con todas las capas apagadas.
+        """
+        total = sum(len(c.pcd.points) for c in capas)
+        if not capas or total <= 0:
+            self._etiqueta_vista.setText("Sin nube cargada")
+            return
+        vis = [c for c in capas if c.visible]
+        n_vis = sum(len(c.pcd.points) for c in vis)
+        n_act = sum(len(c.pcd.points) for c in activas)
+        self._etiqueta_vista.setText(
+            f"<b>Ver:</b> {len(vis)} de {len(capas)} capas<br>"
+            f"{n_vis:,} de {total:,} pts ({100.0 * n_vis / total:.0f} %)"
+            f"<br><br><b>Usar:</b> {len(activas)} "
+            f"{'capa' if len(activas) == 1 else 'capas'}<br>"
+            f"{n_act:,} pts ({100.0 * n_act / total:.0f} %)")
 
     # ------------------------------------------------------------------ #
 

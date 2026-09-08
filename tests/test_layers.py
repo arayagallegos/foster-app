@@ -444,3 +444,113 @@ def test_invertir_visibilidad_da_el_complemento():
     assert [c.visible for c in s.layers] == [not v for v in antes]
     s.invertir_visibilidad()
     assert [c.visible for c in s.layers] == antes
+
+
+# --------------------------------------------------------------- varias activas
+
+def _stack_tres(n=10):
+    s = LayerStack()
+    for k in range(3):
+        pts = np.zeros((n, 3)); pts[:, 0] = np.arange(n) + 100 * k
+        s.layers.append(CloudLayer(name=f"Scan {k}",
+                                   pcd=o3d.geometry.PointCloud(
+                                       o3d.utility.Vector3dVector(pts))))
+    return s
+
+
+def test_varias_activas_la_capa_active_es_la_union():
+    s = _stack_tres()
+    s.set_activas([0, 2])
+    assert s.active_indices == [0, 2]
+    assert len(s.active.pcd.points) == 20
+    xs = np.asarray(s.active.pcd.points)[:, 0]
+    assert xs[0] == 0 and xs[10] == 200          # respeta el orden de active_indices
+    assert list(s.origen_activo()) == [0] * 10 + [2] * 10
+    assert s.active_index == 0                   # compat: la primera
+
+
+def test_active_index_sigue_funcionando_como_antes():
+    s = _stack_tres()
+    s.active_index = 1
+    assert s.active_indices == [1] and s.active is s.layers[1]
+
+
+def test_set_activas_ignora_repetidos_y_fuera_de_rango():
+    s = _stack_tres()
+    s.set_activas([2, 2, 0, 99, -1])
+    assert s.active_indices == [2, 0]
+
+
+def test_split_activas_reparte_la_mascara_por_capa():
+    s = _stack_tres()
+    s.set_activas([0, 1])
+    keep = np.zeros(20, dtype=bool)
+    keep[:4] = True          # 4 puntos de Scan 0
+    keep[10:] = True         # Scan 1 entero
+    n_div, n_comp, n_sin = s.split_activas(keep)
+    assert (n_div, n_comp, n_sin) == (1, 1, 0)
+    nombres = [c.name for c in s.layers]
+    assert nombres == ["Scan 0 · dentro 1", "Scan 0 · fuera 1", "Scan 1", "Scan 2"]
+    assert len(s.layers[0].pcd.points) == 4 and len(s.layers[1].pcd.points) == 6
+    assert s.layers[1].descarte and not s.layers[1].visible
+    assert s.active_indices == [0, 2]            # las mitades capturadas
+
+
+def test_split_activas_marca_como_descarte_la_capa_sin_aporte():
+    s = _stack_tres()
+    s.set_activas([0, 1])
+    keep = np.zeros(20, dtype=bool); keep[:5] = True     # Scan 1 no aporta nada
+    assert s.split_activas(keep) == (1, 0, 1)
+    assert s.layers[2].name == "Scan 1" and s.layers[2].descarte
+
+
+def test_split_activas_valida_el_largo_de_la_mascara():
+    s = _stack_tres()
+    s.set_activas([0, 1])
+    with pytest.raises(ValueError, match="puntos activos"):
+        s.split_activas(np.ones(10, dtype=bool))
+
+
+def test_extraer_de_activas_saca_capas_y_vacia_el_origen():
+    s = _stack_tres()
+    s.set_activas([0, 1])
+    m1 = np.zeros(20, dtype=bool); m1[:3] = True
+    m2 = np.zeros(20, dtype=bool); m2[10:] = True        # Scan 1 completo
+    nuevas = s.extraer_de_activas([("Cluster 0", m1), ("Cluster 1", m2)])
+    assert [c.name for c in nuevas] == ["Cluster 0", "Cluster 1"]
+    nombres = [c.name for c in s.layers]
+    assert nombres == ["Scan 0", "Cluster 0", "Cluster 1", "Scan 2"]  # Scan 1 vacia
+    assert len(s.layers[0].pcd.points) == 7             # 10 - 3 extraidos
+    assert s.active_indices == [1, 2]                   # las capas nuevas
+
+
+def test_eliminar_de_activas_quita_de_cada_capa_de_origen():
+    s = _stack_tres()
+    s.set_activas([0, 2])
+    mask = np.zeros(20, dtype=bool); mask[:2] = True; mask[10:15] = True
+    assert s.eliminar_de_activas(mask) == 7
+    assert len(s.layers[0].pcd.points) == 8
+    assert len(s.layers[1].pcd.points) == 10            # no activa: intacta
+    assert len(s.layers[2].pcd.points) == 5
+
+
+def test_remove_remapea_todas_las_activas():
+    s = _stack_tres()
+    s.set_activas([0, 2])
+    s.remove(1)
+    assert s.active_indices == [0, 1]
+
+
+def test_remove_de_una_activa_conserva_las_demas():
+    s = _stack_tres()
+    s.set_activas([0, 2])
+    s.remove(0)
+    assert s.active_indices == [1]
+
+
+def test_la_capa_combinada_se_reusa_mientras_no_cambien_las_capas():
+    s = _stack_tres()
+    s.set_activas([0, 1])
+    assert s.active is s.active                          # cacheada
+    s.set_activas([0, 2])
+    assert len(s.active.pcd.points) == 20

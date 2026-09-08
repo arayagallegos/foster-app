@@ -10,7 +10,7 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup, QDockWidget, QGroupBox, QHBoxLayout, QLabel, QListWidget,
-    QMessageBox, QPushButton, QRadioButton, QSlider,
+    QListWidgetItem, QMessageBox, QPushButton, QRadioButton, QSlider,
     QCheckBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
@@ -41,10 +41,164 @@ _AYUDA = (
     "<b>Capas</b><br>"
     "Las herramientas operan sobre la capa activa (fila seleccionada). El checkbox "
     "muestra/oculta cada capa. 'Exportar visibles' une las capas visibles en un "
-    ".ply — ojo: si dejas visibles la fuente Y su recorte, exportas puntos "
+    ".ply. Ojo: si dejas visibles la fuente Y su recorte, exportas puntos "
     "duplicados.<br><br>"
     "<b>Camara</b><br>Shift+arrastrar desplaza el encuadre (pan)."
 )
+
+
+# Ayuda por herramienta. Un texto único obligaba a leer sobre el lazo estando en
+# la esfera, que es justo cuando el usuario no necesita saber del lazo.
+_COMUN = (
+    "<hr><b>En todas las herramientas</b><br>"
+    "Colores de previsualización: VERDE = se conserva, ROJO = se elimina.<br>"
+    "Las herramientas operan sobre las capas marcadas en <b>Usar</b>, que "
+    "pueden ser varias.<br>"
+    "Si los manipuladores quedan detrás de la nube, baja la opacidad o el "
+    "tamaño de punto desde el menú Visibilidad."
+)
+
+_AYUDA_TOOL = {
+    "caja": (
+        "<b>Recorte por caja</b><br>"
+        "Define un prisma arrastrando las esferas de sus caras. Lo de dentro se "
+        "conserva y lo de fuera va a una capa de descarte.<br><br>"
+        "Se aplica a TODAS las capas visibles a la vez: con 35 escaneos, "
+        "recortar de uno en uno es impracticable. Las capas que quedan enteras "
+        "dentro no se dividen, y las que quedan enteras fuera solo se ocultan."
+    ),
+    "lazo": (
+        "<b>Recorte por lazo</b><br>"
+        "1. Elige la operación.<br>"
+        "2. 'Iniciar lazo' y clic sobre la vista para marcar vértices.<br>"
+        "3. Cierra con clic derecho, doble clic o clic sobre el primer "
+        "vértice.<br>"
+        "4. Encadena los lazos que necesites y pulsa 'Aplicar recorte'.<br><br>"
+        + "<br>".join(f"&middot; <b>{lab}</b>: {ayuda}"
+                      for lab, _v, ayuda in LASSO_OPS)
+        + "<br><br><b>Cuidado:</b> el lazo selecciona por proyección en "
+        "pantalla, así que captura a cualquier profundidad. Sobre una superficie "
+        "curva perfora también la cara opuesta: para eso usa la agrupación, que "
+        "opera en tres dimensiones."
+    ),
+    "esfera": (
+        "<b>Primitiva esfera</b><br>"
+        "Arrastra la esfera sobre la nube; al soltar se ajusta a los puntos "
+        "cercanos y se previsualiza lo capturado.<br><br>"
+        "<b>Tolerancia</b>: cuán lejos de la cáscara puede estar un punto "
+        "capturado.<br>"
+        "<b>Recorte angular</b>: en qué franja de la esfera buscar.<br><br>"
+        "Los dos hacen falta y no se sustituyen. En la cúpula del Observatorio "
+        "el faldón se desvía hasta 36 cm de la esfera y las compuertas están a "
+        "43 cm: no existe una tolerancia que capture uno sin absorber las otras. "
+        "Lo que sí los separa es el ángulo, porque no se solapan."
+    ),
+    "plano": (
+        "<b>Primitiva plano</b><br>"
+        "Coloca el plano y se ajusta a los puntos cercanos al soltarlo.<br><br>"
+        "<b>Tolerancia</b>: distancia máxima al plano.<br>"
+        "<b>Radio</b>: limita el disco, para no capturar material lejano que "
+        "casualmente cae en el mismo plano.<br>"
+        "<b>Desplazamiento</b>: mueve el plano por su normal sin reajustarlo. "
+        "'Volver al ajuste' deshace el desplazamiento."
+    ),
+    "cilindro": (
+        "<b>Primitiva cilindro</b><br>"
+        "No hay manipulador de cilindro: se coloca el EJE arrastrando los dos "
+        "extremos del segmento, y el radio lo recupera el ajuste.<br><br>"
+        "<b>Tramo</b>: limita el trozo del eje que se usa, para capturar solo "
+        "una franja de altura.<br><br>"
+        "Basta una aproximación gruesa: partiendo de un eje puesto a propósito "
+        "torcido, el ajuste recuperó un radio de 4,395 m frente a 4,41 m reales."
+    ),
+    "cono": (
+        "<b>Primitiva cono</b><br>"
+        "Igual que el cilindro: se coloca el eje y el ajuste recupera la "
+        "apertura. Con el eje fijo, el radio de un cono crece linealmente con la "
+        "altura, así que ajustar el cono se reduce a ajustar una recta.<br><br>"
+        "<b>Apertura</b>: cambia el semiángulo a mano. El cono gira en torno a "
+        "la mitad del tramo para no despegarse de los datos por un extremo. "
+        "'Volver al ajuste' recupera el valor calculado.<br><br>"
+        "El cilindro es el caso de apertura cero."
+    ),
+    "dbscan": (
+        "<b>Agrupación por densidad</b><br>"
+        "Agrupa puntos por cercanía mutua, sin suponer ninguna forma. Es para lo "
+        "que las primitivas no describen: mobiliario, vegetación, "
+        "contrafuertes.<br><br>"
+        "<b>Va DESPUÉS de las primitivas</b>, no en su lugar. Separa lo que está "
+        "físicamente desconectado, y una estructura completa es una sola "
+        "superficie continua: aplicada a la nube entera devuelve un único grupo "
+        "con el 99,9 % de los puntos. Retira antes las superficies grandes.<br><br>"
+        "<b>Radio</b> y <b>vecinos mínimos</b> hablan de la misma densidad. "
+        "Parte siempre del valor sugerido: está calculado a partir del espaciado "
+        "de esta nube, y un valor traído de otra nube no se traslada.<br><br>"
+        "<b>Tamaño mínimo</b> oculta los grupos diminutos, que suelen ser "
+        "centenares. Se aplica después de agrupar, así que moverlo es "
+        "instantáneo."
+    ),
+    "simetria": (
+        "<b>Reparación por simetría</b><br>"
+        "Completa zonas sin cobertura reflejando material realmente medido del "
+        "lado opuesto. No inventa superficie a partir de un modelo: traslada "
+        "puntos que existen.<br><br>"
+        "1. Coloca el plano de simetría a ojo.<br>"
+        "2. 'Refinar plano': el ajuste lo afina sobre los datos.<br>"
+        "3. Mira la <b>concordancia</b> antes de aceptar.<br><br>"
+        "<b>Concordancia</b>: fracción de puntos reflejados que caen SOBRE "
+        "puntos reales. Comprueba que la simetría existe, usando la zona donde "
+        "hay material a ambos lados. Alta significa que el plano está bien "
+        "puesto; baja, que el relleno sería material inventado sin fundamento. "
+        "En el Observatorio: 91-95 % en las compuertas, 88 % en la cúpula.<br><br>"
+        "El relleno va a una CAPA APARTE y se dibuja en azul, no en verde: es "
+        "material generado y debe poder distinguirse del medido. Únelo a la "
+        "entidad solo cuando estés conforme."
+    ),
+    "malla": (
+        "<b>Reconstrucción de malla</b><br>"
+        "Convierte la entidad en superficie triangulada exportable. Es el último "
+        "paso, sobre una entidad ya segmentada y reparada.<br><br>"
+        "<b>Perímetro máximo de triángulo</b>: impide que la triangulación "
+        "puentee los vacíos con triángulos estirados. Es el parámetro que decide "
+        "el resultado; parte del valor sugerido, que son 14 veces el espaciado "
+        "de esta nube.<br><br>"
+        "<b>Cerrar agujeros</b>: los pequeños son oclusiones y conviene "
+        "cerrarlos; los grandes son zonas sin cobertura, y cerrarlos sería "
+        "fabricar superficie.<br>"
+        "<hr>"
+        "<b>Cómo leer las cifras</b><br>"
+        "La malla se compara con los puntos en dos direcciones opuestas, y hay "
+        "que mirar las dos porque responden preguntas distintas.<br><br>"
+
+        "<b>Cobertura.</b> Dice si <b>falta</b> superficie. Para cada punto "
+        "medido, mira a qué distancia le queda la superficie: si la malla dejó "
+        "fuera una zona donde sí había datos, esos puntos quedan lejos y la "
+        "cifra sube.<br>"
+        "&nbsp;&nbsp;&middot; <b>Resolución.</b> Es el mínimo que la cobertura "
+        "puede dar. La distancia se mide contra una versión muestreada de la "
+        "superficie, así que nunca sale cero exacto. <i>Ejemplo:</i> cobertura "
+        "0,84 cm con resolución 0,82 cm significa que la malla pasa por los "
+        "puntos tan cerca como puede medirse, y no hay nada que corregir.<br>"
+        "&nbsp;&nbsp;&middot; <b>Peor 5 %.</b> La media esconde los casos malos: "
+        "si 100 puntos de 10.000 están a 5 cm, apenas se mueve. Esta cifra los "
+        "delata.<br><br>"
+
+        "<b>Invención.</b> Dice si <b>sobra</b> superficie: qué porcentaje de la "
+        "malla está a más de 5 cm de cualquier punto medido, es decir, "
+        "superficie que nadie escaneó y el algoritmo se inventó.<br>"
+        "&nbsp;&nbsp;Mirar solo la cobertura engañaría: hay métodos que dan "
+        "1,75 cm de cobertura (aparentemente excelente) fabricando el 31 % de la "
+        "superficie.<br><br>"
+
+        "<b>Contornos.</b> Dicen qué quedó <b>abierto</b>. Un agujero es un "
+        "contorno cerrado de borde, no un hueco visual: el borde exterior de la "
+        "pieza cuenta como UNO por dentado que se vea. Su perímetro mide cuánto "
+        "<i>serpentea</i> ese borde, no el tamaño del hueco, y por eso salen "
+        "decenas de metros en piezas pequeñas.<br>"
+        "&nbsp;&nbsp;<b>El mayor</b> te dice a cuánto habría que subir el umbral "
+        "para cerrarlos todos, y por tanto cuánta superficie fabricarías."
+    ),
+}
 
 
 class CropDock(QDockWidget):
@@ -77,6 +231,10 @@ class CropDock(QDockWidget):
     dbscan_capturar = pyqtSignal()
     dbscan_eliminar = pyqtSignal()
 
+    malla_generar = pyqtSignal(float, bool, float)   # perimetro, rellenar, per. relleno
+    malla_exportar = pyqtSignal()
+    malla_vista_changed = pyqtSignal(str)   # 'malla' | 'nube' | 'ambas'
+
     simetria_params_changed = pyqtSignal(float, bool)  # tolerancia, acotar zona
     simetria_refinar = pyqtSignal()
     simetria_aplicar = pyqtSignal()
@@ -94,6 +252,9 @@ class CropDock(QDockWidget):
     # ------------------------------------------------------------------ #
     # UI                                                                 #
     # ------------------------------------------------------------------ #
+
+    _ma_sugerido: float | None = None
+    _tool_actual: str | None = None
 
     def _build_ui(self) -> None:
         contenido = QWidget()
@@ -124,6 +285,7 @@ class CropDock(QDockWidget):
         self._stack.addWidget(self._build_page_cono())      # index 5
         self._stack.addWidget(self._build_page_dbscan())    # index 6
         self._stack.addWidget(self._build_page_simetria())  # index 7
+        self._stack.addWidget(self._build_page_malla())      # index 8
         tool_layout.addWidget(self._stack)
         layout.addWidget(self._tool_box)
 
@@ -409,7 +571,7 @@ class CropDock(QDockWidget):
                   self._sld_co_ap):
             s.valueChanged.connect(self._emit_cono_params)
 
-        self._lbl_co_info = QLabel("—")
+        self._lbl_co_info = QLabel("Sin ajustar")
         self._lbl_co_info.setStyleSheet("color: #aaaaaa; font-size: 11px;")
         lay.addWidget(self._lbl_co_info)
 
@@ -618,7 +780,7 @@ class CropDock(QDockWidget):
 
         # La concordancia es el indicador de confianza: va destacada, porque es
         # lo que dice si el material generado tiene respaldo o es invención.
-        self._lbl_si_conc = QLabel("Concordancia: —")
+        self._lbl_si_conc = QLabel("Concordancia: sin calcular")
         self._lbl_si_conc.setStyleSheet("font-size: 15px; font-weight: 600;")
         lay.addWidget(self._lbl_si_conc)
         self._lbl_si_ayuda = QLabel(
@@ -674,7 +836,7 @@ class CropDock(QDockWidget):
 
     def set_simetria_concordancia(self, conc: float | None, n_relleno: int = 0) -> None:
         if conc is None:
-            self._lbl_si_conc.setText("Concordancia: —")
+            self._lbl_si_conc.setText("Concordancia: sin calcular")
         else:
             self._lbl_si_conc.setText(
                 f"Concordancia: {100 * conc:.1f} %  ·  relleno {n_relleno:,} pts")
@@ -682,6 +844,248 @@ class CropDock(QDockWidget):
 
     def simetria_acota_zona(self) -> bool:
         return self._chk_si_zona.isChecked()
+
+    # ------------------------------------------------------------------ malla
+
+    def _build_page_malla(self) -> QWidget:
+        """Reconstrucción: de la entidad segmentada a superficie triangulada.
+
+        El único parámetro que gobierna el resultado es el límite de perímetro,
+        y viene propuesto en proporción al espaciado de la nube (14 veces), que
+        es la regla que salió del barrido. Se deja modificable porque una
+        entidad con densidad muy irregular puede necesitar otro valor, pero el
+        usuario no debería tener que calcularlo.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._lbl_ma_ref = QLabel("Marca una entidad en 'Usar' para empezar.")
+        self._lbl_ma_ref.setWordWrap(True)
+        self._lbl_ma_ref.setStyleSheet("color: #aaaaaa; font-size: 11px;")
+        lay.addWidget(self._lbl_ma_ref)
+
+        self._lbl_ma_per = QLabel()
+        self._sld_ma_per = QSlider(Qt.Orientation.Horizontal)
+        self._sld_ma_per.setRange(1, 200)             # 0,01 .. 2,00 m
+        self._sld_ma_per.setValue(30)
+        self._sld_ma_per.setToolTip(
+            "Perímetro máximo de un triángulo. Es lo que impide que la "
+            "triangulación puentee los vacíos con triángulos estirados e invente "
+            "superficie donde no hubo medición. Demasiado pequeño, la malla sale "
+            "agujereada.")
+        lay.addWidget(self._lbl_ma_per)
+        lay.addWidget(self._sld_ma_per)
+
+        self._btn_ma_sugerido = QPushButton("Volver al valor sugerido")
+        self._btn_ma_sugerido.setToolTip(
+            "Devuelve el límite a 14 veces el espaciado de la nube.")
+        self._btn_ma_sugerido.clicked.connect(self._volver_a_perimetro_sugerido)
+        lay.addWidget(self._btn_ma_sugerido)
+
+        self._chk_ma_rellenar = QCheckBox("Cerrar agujeros pequeños")
+        self._chk_ma_rellenar.setChecked(True)
+        self._chk_ma_rellenar.setToolTip(
+            "Los agujeros pequeños son oclusiones y conviene cerrarlos; los "
+            "grandes son zonas sin cobertura y cerrarlos sería fabricar "
+            "superficie. Solo se cierran los que quedan bajo el umbral.")
+        self._chk_ma_rellenar.toggled.connect(self._actualizar_labels_malla)
+        lay.addWidget(self._chk_ma_rellenar)
+
+        self._lbl_ma_rel = QLabel()
+        self._sld_ma_rel = QSlider(Qt.Orientation.Horizontal)
+        self._sld_ma_rel.setRange(1, 200)             # 0,1 .. 20,0 m
+        self._sld_ma_rel.setValue(50)
+        self._sld_ma_rel.setToolTip(
+            "Perímetro máximo de los agujeros que se cierran. Los mayores se "
+            "dejan abiertos a propósito.")
+        lay.addWidget(self._lbl_ma_rel)
+        lay.addWidget(self._sld_ma_rel)
+
+        for s in (self._sld_ma_per, self._sld_ma_rel):
+            s.valueChanged.connect(self._actualizar_labels_malla)
+
+        # Botón explícito, como en la agrupación: triangular es lo caro y no
+        # puede dispararse al arrastrar un control.
+        self._btn_ma_run = QPushButton("Generar malla")
+        self._btn_ma_run.setToolTip(
+            "Triangula las capas en uso y mide la fidelidad del resultado. "
+            "Corre en segundo plano.")
+        self._btn_ma_run.clicked.connect(
+            lambda: self.malla_generar.emit(
+                self._sld_ma_per.value() / 100.0,
+                self._chk_ma_rellenar.isChecked(),
+                self._sld_ma_rel.value() / 10.0))
+        lay.addWidget(self._btn_ma_run)
+
+        # Qué se mira tras generar. Hace falta porque la malla interpola los
+        # puntos: dibujadas a la vez, la nube tapa la superficie por completo y
+        # el resultado parece idéntico a no haber hecho nada.
+        fila_vista = QWidget()
+        fv = QHBoxLayout(fila_vista)
+        fv.setContentsMargins(0, 0, 0, 0)
+        fv.addWidget(QLabel("Ver:"))
+        self._grp_ma_vista = QButtonGroup(self)
+        for etiqueta, clave, ayuda in (
+            ("Malla", "malla", "Solo la superficie generada."),
+            ("Nube", "nube", "Solo los puntos de partida."),
+            ("Ambas", "ambas",
+             "La malla semitransparente con los puntos encima. Util para ver "
+             "si algun punto queda fuera de la superficie."),
+        ):
+            rb = QRadioButton(etiqueta)
+            rb.setToolTip(ayuda)
+            rb.setProperty("clave", clave)
+            rb.setChecked(clave == "malla")
+            rb.toggled.connect(self._emit_malla_vista)
+            self._grp_ma_vista.addButton(rb)
+            fv.addWidget(rb)
+        fv.addStretch(1)
+        self._fila_ma_vista = fila_vista
+        fila_vista.setEnabled(False)
+        lay.addWidget(fila_vista)
+
+        self._lbl_ma_res = QLabel("Sin generar")
+        self._lbl_ma_res.setWordWrap(True)
+        self._lbl_ma_res.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_ma_res.setStyleSheet("font-size: 11px;")
+        lay.addWidget(self._lbl_ma_res)
+
+        self._btn_ma_export = QPushButton("Exportar malla (.ply)")
+        self._btn_ma_export.setToolTip(
+            "Guarda la malla generada. El nombre parte del de la entidad.")
+        self._btn_ma_export.setEnabled(False)
+        self._btn_ma_export.clicked.connect(self.malla_exportar)
+        lay.addWidget(self._btn_ma_export)
+
+        self._actualizar_labels_malla()
+        return page
+
+    def _actualizar_labels_malla(self) -> None:
+        self._lbl_ma_per.setText(
+            f"Perímetro máximo de triángulo: {self._sld_ma_per.value() / 100:.2f} m")
+        self._lbl_ma_rel.setText(
+            f"Cerrar agujeros de hasta: {self._sld_ma_rel.value() / 10:.1f} m")
+        activo = self._chk_ma_rellenar.isChecked()
+        self._lbl_ma_rel.setEnabled(activo)
+        self._sld_ma_rel.setEnabled(activo)
+
+    def _volver_a_perimetro_sugerido(self) -> None:
+        if self._ma_sugerido is not None:
+            self._sld_ma_per.setValue(
+                max(1, min(200, round(self._ma_sugerido * 100))))
+
+    def set_malla_referencia(self, espaciado: float | None,
+                             n_puntos: int = 0) -> None:
+        """Propone el límite de perímetro a partir del espaciado de la entidad."""
+        if espaciado is None or espaciado <= 0:
+            self._ma_sugerido = None
+            self._lbl_ma_ref.setText("Marca una entidad en 'Usar' para empezar.")
+            return
+        self._ma_sugerido = 14.0 * espaciado
+        self._lbl_ma_ref.setText(
+            f"{n_puntos:,} puntos · espaciado {espaciado:.4f} m · "
+            f"límite sugerido {self._ma_sugerido:.2f} m (14 × el espaciado)")
+        self._volver_a_perimetro_sugerido()
+
+    def _emit_malla_vista(self, marcado: bool) -> None:
+        if marcado:
+            self.malla_vista_changed.emit(self.sender().property("clave"))
+
+    def malla_vista(self) -> str:
+        boton = self._grp_ma_vista.checkedButton()
+        return boton.property("clave") if boton else "malla"
+
+    def set_malla_resultado(self, texto: str | None,
+                            exportable: bool = False) -> None:
+        """Mensaje suelto: en curso, o el motivo de un fallo."""
+        self._lbl_ma_res.setText(texto or "Sin generar")
+        self._btn_ma_export.setEnabled(bool(exportable))
+        self._fila_ma_vista.setEnabled(bool(exportable))
+
+    def set_malla_metricas(self, n_caras: int, n_vertices: int, n_puntos: int,
+                           fid, stats: dict | None = None) -> None:
+        """Las cifras del resultado, agrupadas por la pregunta que responden.
+
+        En un párrafo corrido no se distingue qué mide cada número ni cuáles se
+        comparan entre sí. Agrupadas —tamaño, fidelidad, diagnóstico— se leen de
+        un vistazo, y la resolución queda junto a la cobertura porque es su
+        suelo: sin verlas juntas, una cobertura pequeña parece un error residual
+        en vez de "tan cerca como esto puede medirse".
+        """
+        def fila(etiqueta, valor, ayuda=""):
+            titulo = f' title="{ayuda}"' if ayuda else ""
+            return (f'<tr><td style="color:#999"{titulo}>{etiqueta}</td>'
+                    f'<td align="right"><b>{valor}</b></td></tr>')
+
+        inventados = max(0, n_vertices - n_puntos)
+        html = ['<table cellspacing="0" cellpadding="2" width="100%">']
+        html.append('<tr><td colspan="2" style="color:#ffffff">'
+                    '<b>Malla</b></td></tr>')
+        html.append(fila("Triángulos", f"{n_caras:,}"))
+        html.append(fila("Vértices", f"{n_vertices:,}",
+                         "Los puntos medidos, más los que se crearon al "
+                         "parchear agujeros."))
+        if inventados:
+            html.append(fila("· creados al parchear", f"{inventados:,}"))
+
+        html.append('<tr><td colspan="2" style="color:#ffffff;padding-top:6px">'
+                    '<b>Fidelidad</b></td></tr>')
+        html.append(fila("Cobertura", f"{fid.cobertura_media * 100:.2f} cm",
+                         "Distancia media de cada punto medido a la superficie. "
+                         "Dice si FALTA superficie donde sí hubo datos."))
+        html.append(fila("· peor 5 %", f"{fid.cobertura_p95 * 100:.2f} cm",
+                         "El 95 % de los puntos está más cerca que esto."))
+        html.append(fila("· resolución", f"{fid.resolucion * 100:.2f} cm",
+                         "Suelo de la medida: la cobertura no puede bajar de "
+                         "aquí aunque la malla fuera exacta."))
+        html.append(fila("Invención", f"{fid.invencion * 100:.2f} %",
+                         f"Superficie a más de {fid.tolerancia * 100:.0f} cm de "
+                         "todo punto medido. Dice si SOBRA superficie."))
+
+        if stats:
+            html.append('<tr><td colspan="2" style="color:#ffffff;'
+                        'padding-top:6px"><b>Diagnóstico</b></td></tr>')
+            ayuda_agujero = (
+                "Un agujero es un CONTORNO cerrado de borde, no un hueco "
+                "visual: el borde exterior de la entidad cuenta como uno solo "
+                "por dentado que se vea en pantalla.")
+            n_antes = stats.get("n_antes")
+            n_abiertos = stats.get("n_holes")
+            if n_antes is not None and n_abiertos is not None:
+                html.append(fila("Contornos al triangular", f"{n_antes}",
+                                 ayuda_agujero))
+                html.append(fila("· cerrados", f"{max(0, n_antes - n_abiertos)}",
+                                 "Los que quedaban por debajo del umbral."))
+            html.append(fila("· abiertos", f"{n_abiertos if n_abiertos is not None else 'n/d'}",
+                             "Superan el umbral: zonas sin cobertura que se "
+                             "dejaron abiertas a propósito. " + ayuda_agujero))
+            if stats.get("mayor"):
+                # Las aristas van al lado del perímetro porque este mide
+                # LONGITUD DE RECORRIDO, no tamaño de abertura: un contorno de
+                # 110 m con 2.300 aristas serpentea alrededor de una pieza de
+                # 7 m, y sin ese dato la cifra se lee como un agujero enorme.
+                aristas = stats.get("mayor_aristas")
+                valor = (f"{stats['mayor']:.1f} m ({aristas:,} aristas)"
+                         if aristas else f"{stats['mayor']:.1f} m")
+                html.append(fila("· el mayor", valor,
+                                 "Perímetro del contorno abierto más grande: la "
+                                 "longitud que recorre su borde, no el tamaño "
+                                 "del hueco. Un contorno con muchas aristas es "
+                                 "un borde dentado, no una abertura grande. "
+                                 "Subir el umbral por encima de este valor los "
+                                 "cerraría todos, fabricando esa superficie."))
+            html.append(fila("Cerrada", "sí" if stats.get("is_closed") else "no",
+                             "Si la superficie encierra un volumen."))
+        html.append("</table>")
+
+        self._lbl_ma_res.setText("".join(html))
+        self._btn_ma_export.setEnabled(True)
+        self._fila_ma_vista.setEnabled(True)
+
+    def set_malla_ocupado(self, ocupado: bool) -> None:
+        self._btn_ma_run.setEnabled(not ocupado)
+        self._btn_ma_run.setText("Generando…" if ocupado else "Generar malla")
 
     def _build_page_lazo(self) -> QWidget:
         page = QWidget()
@@ -720,13 +1124,14 @@ class CropDock(QDockWidget):
     # ------------------------------------------------------------------ #
 
     PAGINAS = {"caja": 0, "lazo": 1, "esfera": 2, "plano": 3, "cilindro": 4,
-               "cono": 5, "dbscan": 6, "simetria": 7}
+               "cono": 5, "dbscan": 6, "simetria": 7, "malla": 8}
 
     def set_tool(self, tool: str) -> None:
         """Cambia la página de herramienta."""
         if tool not in self.PAGINAS:
             raise ValueError(f"Herramienta desconocida: {tool}")
         self._stack.setCurrentIndex(self.PAGINAS[tool])
+        self._tool_actual = tool
         self._tool_box.setTitle(f"Herramienta: {tool.capitalize()}")
 
     def set_lasso_active(self, active: bool) -> None:
@@ -741,7 +1146,14 @@ class CropDock(QDockWidget):
     # ------------------------------------------------------------------ #
 
     def _show_help(self) -> None:
-        QMessageBox.information(self, "Ayuda — Recorte", _AYUDA)
+        """Ayuda de la herramienta activa, no un texto único para todas."""
+        tool = self._tool_actual
+        texto = _AYUDA_TOOL.get(tool)
+        if texto is None:
+            QMessageBox.information(self, "Ayuda", _AYUDA)
+            return
+        QMessageBox.information(self, f"Ayuda: {tool.capitalize()}",
+                                texto + _COMUN)
 
     def _emit_lasso_started(self) -> None:
         checked = self._lasso_op_group.checkedButton()
