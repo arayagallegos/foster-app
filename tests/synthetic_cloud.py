@@ -142,7 +142,7 @@ def make_synthetic_foster_dificil(seed: int = 0) -> tuple[np.ndarray, np.ndarray
 # ------------------------------------------------------------------ #
 # Nube fiel a escala real, con 6 clases (para segment_by_profile)      #
 # ------------------------------------------------------------------ #
-# Dimensiones medidas del Foster (ver docs/bitacora_segmentacion.md):
+# Dimensiones medidas del Foster:
 R_T = 4.41          # radio exterior del tambor
 ESP_MURO = 0.21     # espesor de muro medido
 R_COR = 4.70        # radio de la cornisa (sobresale)

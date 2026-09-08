@@ -4,7 +4,7 @@ meshing.py — Reconstrucción de malla a partir de una entidad segmentada.
 Cierra el flujo de la herramienta: la segmentación entrega nubes de puntos por
 entidad, y esto las convierte en superficie triangulada exportable.
 
-El método está decidido con evidencia, no por intuición (`docs/resumen_experimentos.md` §2):
+El método está decidido con evidencia, no por intuición:
 
     metodo                                  invencion  puntos usados  manifold
     Poisson (Open3D)                            31 %       todos      si
@@ -31,7 +31,7 @@ PERIMETRO_POR_ESPACIADO = 14.0
 
 Es el parámetro que hace ganar a Advancing Front: sin él, el frente de avance
 "puentea" los vacíos con triángulos estirados e inventa superficie donde no hubo
-medición. Medido sobre las compuertas (`docs/resumen_experimentos.md` §2):
+medición. Medido sobre las compuertas:
 
     max_perimetro   invencion
     sin limite        7,20 %

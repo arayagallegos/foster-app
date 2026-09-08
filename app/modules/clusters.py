@@ -39,8 +39,7 @@ RUIDO = -1
 EPS_POR_ESPACIADO = 7.0
 """Cuántas veces el espaciado debe valer `eps`, y qué fracción de los vecinos
 debe valer `min_points`. NO son cifras inventadas: salen de la corrida que dio
-buen resultado sobre el interior del Observatorio (documentada en
-`docs/resumen_experimentos.md`).
+buen resultado sobre el interior del Observatorio (documentada en la memoria).
 
     nube        interior.ply, 253.744 puntos
     espaciado   0.0215 m
